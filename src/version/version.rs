@@ -27,6 +27,7 @@ pub enum EngineVersion {
     V17 = 17,
     V18 = 18,
     V19 = 19,
+    V20 = 20,
 }
 
 pub enum ProtocolFeature {
@@ -52,6 +53,7 @@ pub enum ProtocolFeature {
     LiveAt,
     StorageExpiryExtension2026,
     BlockLinks,
+    IncreaseEmbedLimitForAllUsers,
 }
 
 pub struct VersionSchedule {
@@ -140,6 +142,10 @@ const ENGINE_VERSION_SCHEDULE_MAINNET: &[VersionSchedule] = [
         active_at: 1785160800, // 2026-07-27 2PM UTC (9:00 AM CDT)
         version: EngineVersion::V19,
     },
+    VersionSchedule {
+        active_at: 1786640400, // 2026-08-13 5PM UTC (12:00 PM CDT)
+        version: EngineVersion::V20,
+    },
 ]
 .as_slice();
 
@@ -208,12 +214,16 @@ const ENGINE_VERSION_SCHEDULE_TESTNET: &[VersionSchedule] = [
         active_at: 1784124000, // 2026-07-15 2PM UTC (9:00 AM CDT)
         version: EngineVersion::V19,
     },
+    VersionSchedule {
+        active_at: 1786035600, // 2026-08-06 5PM UTC (12:00 PM CDT)
+        version: EngineVersion::V20,
+    },
 ]
 .as_slice();
 
 const ENGINE_VERSION_SCHEDULE_DEVNET: &[VersionSchedule] = [VersionSchedule {
     active_at: 0,
-    version: EngineVersion::V19,
+    version: EngineVersion::V20,
 }]
 .as_slice();
 
@@ -269,6 +279,13 @@ impl EngineVersion {
             ProtocolFeature::LiveAt => self >= &EngineVersion::V17,
             ProtocolFeature::StorageExpiryExtension2026 => self >= &EngineVersion::V18,
             ProtocolFeature::BlockLinks => self >= &EngineVersion::V19,
+            // Raises the cast embed cap to 4 for every fid, not just Pro subscribers. A pure
+            // loosening: nothing that validated before this boundary stops validating after it,
+            // so replay of pre-V20 history is untouched. It is still versioned because the
+            // rolling-upgrade window is not symmetric — an upgraded proposer includes a 4-embed
+            // non-Pro cast that an un-upgraded validator rejects, which is exactly the root
+            // mismatch that stalled shard 1 before this landed.
+            ProtocolFeature::IncreaseEmbedLimitForAllUsers => self >= &EngineVersion::V20,
         }
     }
 
@@ -290,7 +307,7 @@ impl EngineVersion {
             EngineVersion::V15 => 10,
             EngineVersion::V16 => 11,
             EngineVersion::V17 => 12,
-            EngineVersion::V18 | EngineVersion::V19 => LATEST_PROTOCOL_VERSION,
+            EngineVersion::V18 | EngineVersion::V19 | EngineVersion::V20 => LATEST_PROTOCOL_VERSION,
         }
     }
 
@@ -575,8 +592,51 @@ mod version_test {
     }
 
     #[test]
+    fn test_embed_limit_activation_schedule() {
+        // Testnet: V20 at 2026-08-06 17:00 UTC; pre-activation returns V19.
+        let testnet_active = 1786035600;
+        assert_eq!(
+            EngineVersion::version_for(
+                &FarcasterTime::from_unix_seconds(testnet_active - 1),
+                FarcasterNetwork::Testnet,
+            ),
+            EngineVersion::V19
+        );
+        assert_eq!(
+            EngineVersion::version_for(
+                &FarcasterTime::from_unix_seconds(testnet_active),
+                FarcasterNetwork::Testnet,
+            ),
+            EngineVersion::V20
+        );
+
+        // Mainnet: V20 at 2026-08-13 17:00 UTC. This boundary is why shard 1
+        // stalled — mainnet began merging 4-embed non-Pro casts here, and a node
+        // still validating at V19 rejected them and diverged on the shard root.
+        let mainnet_active = 1786640400;
+        assert_eq!(
+            EngineVersion::version_for(
+                &FarcasterTime::from_unix_seconds(mainnet_active - 1),
+                FarcasterNetwork::Mainnet,
+            ),
+            EngineVersion::V19
+        );
+        assert_eq!(
+            EngineVersion::version_for(
+                &FarcasterTime::from_unix_seconds(mainnet_active),
+                FarcasterNetwork::Mainnet,
+            ),
+            EngineVersion::V20
+        );
+
+        // And the gate itself follows the boundary, not the wall clock.
+        assert!(!EngineVersion::V19.is_enabled(ProtocolFeature::IncreaseEmbedLimitForAllUsers));
+        assert!(EngineVersion::V20.is_enabled(ProtocolFeature::IncreaseEmbedLimitForAllUsers));
+    }
+
+    #[test]
     fn test_latest() {
-        assert_eq!(EngineVersion::latest(), EngineVersion::V19);
+        assert_eq!(EngineVersion::latest(), EngineVersion::V20);
         assert_eq!(
             EngineVersion::version_for(&FarcasterTime::current(), FarcasterNetwork::Devnet),
             EngineVersion::latest()
@@ -626,6 +686,12 @@ mod version_test {
         );
 
         let time = FarcasterTime::from_unix_seconds(1785160800);
+        assert_eq!(
+            EngineVersion::next_version_timestamp_for(&time, FarcasterNetwork::Mainnet),
+            Some(1786640400)
+        );
+
+        let time = FarcasterTime::from_unix_seconds(1786640400);
         assert_eq!(
             EngineVersion::next_version_timestamp_for(&time, FarcasterNetwork::Mainnet),
             None

@@ -23,6 +23,7 @@ use crate::storage::store::account::{
 use crate::storage::store::engine_metrics::Metrics;
 use crate::storage::store::mempool_poller::{MempoolMessage, MempoolPoller, MempoolPollerError};
 use crate::storage::store::migrations::{MigrationContext, MigrationRunner};
+use crate::storage::store::node_local_state;
 use crate::storage::store::stores::{StoreLimits, Stores};
 use crate::storage::trie::{self, merkle_trie};
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
@@ -175,6 +176,10 @@ pub struct ShardEngine {
     hyper_stores: Option<Stores>,
     metrics: Metrics,
     pending_txn: Option<CachedTransaction>,
+    /// Whether a stale `ShardHalt` record from a previous run has been cleared
+    /// yet. Checked once, on the first successful commit after start, so a
+    /// resolved halt stops being reported without costing a read per block.
+    halt_record_checked: bool,
     fname_signer_address: Option<alloy_primitives::Address>,
     post_commit_tx: Option<mpsc::Sender<PostCommitMessage>>,
     pub mempool_poller: MempoolPoller,
@@ -270,6 +275,7 @@ impl ShardEngine {
                 shard_id,
             },
             pending_txn: None,
+            halt_record_checked: false,
             fname_signer_address,
             post_commit_tx,
         })
@@ -2099,6 +2105,18 @@ impl ShardEngine {
                 &FarcasterTime::new(header.timestamp),
             ) {
                 Err(err) => {
+                    // Persist before panicking. The panic below is caught by
+                    // ractor, which stops the ReadHost actor but leaves the
+                    // process up and unsupervised — so this `error!` is the only
+                    // statement of the cause, and it scrolls out of the log while
+                    // the shard stays dead and `read_sync` emits SendErr forever.
+                    // The record is what an operator can still read afterwards.
+                    node_local_state::LocalStateStore::record_shard_halt(
+                        &self.db,
+                        self.shard_id,
+                        block_number,
+                        &err.to_string(),
+                    );
                     error!("State change commit failed: {}", err);
                     panic!("State change commit failed: {}", err);
                 }
@@ -2106,6 +2124,21 @@ impl ShardEngine {
                     self.commit_and_emit_events(shard_chunk, events, max_block_event_seqnum, txn)
                         .await;
                 }
+            }
+        }
+
+        // A commit got through, so any halt on record belongs to a previous run
+        // and has been resolved. Clearing it keeps the status endpoint from
+        // reporting a shard as dead after it recovered. Once per process.
+        if !self.halt_record_checked {
+            self.halt_record_checked = true;
+            if node_local_state::LocalStateStore::read_shard_halt(&self.db, self.shard_id).is_some()
+            {
+                warn!(
+                    shard_id = self.shard_id,
+                    "Clearing a halt recorded by a previous run; this shard is committing again"
+                );
+                node_local_state::LocalStateStore::clear_shard_halt(&self.db, self.shard_id);
             }
         }
     }
