@@ -477,6 +477,16 @@ pub struct DailyStatsIndexer {
     config: DailyStatsConfig,
     db: Arc<RocksDB>,
     pending: Mutex<BTreeMap<u32, DayAccumulator>>,
+    /// Serializes `write_days`.
+    ///
+    /// Every stored value is folded in with a read-modify-write (counters sum,
+    /// fid sets union, HLL registers max), and the drain from `pending` releases
+    /// its lock before any of that happens. With the backfill walk running
+    /// concurrently with the live path, two flushes can target the same day at
+    /// once — both read the same base, and whichever commits last silently
+    /// discards the other's delta. Flushes are seconds apart, so serializing
+    /// them costs nothing.
+    write_lock: Mutex<()>,
     /// Events folded into `pending` since the last flush.
     pending_events: AtomicU64,
     /// Distinct fid entries currently resident across all pending days. Drives
@@ -511,6 +521,7 @@ impl DailyStatsIndexer {
             config,
             db,
             pending: Mutex::new(BTreeMap::new()),
+            write_lock: Mutex::new(()),
             pending_events: AtomicU64::new(0),
             pending_fids: AtomicU64::new(0),
             backfill_mode: std::sync::atomic::AtomicBool::new(false),
@@ -912,6 +923,9 @@ impl DailyStatsIndexer {
         if days.is_empty() {
             return Ok(());
         }
+        // Held across the whole read-merge-write cycle, not just the commit:
+        // the read is the half that has to be protected.
+        let _guard = self.write_lock.lock().unwrap();
         let mut txn = RocksDbTransactionBatch::new();
         let n = days.len() as u64;
 
@@ -1825,6 +1839,58 @@ mod tests {
         assert_eq!(
             rows[0].casts.total, 1,
             "time-based flush must land the current day without an event-count trip"
+        );
+    }
+
+    /// Regression guard for the lost-update race between the concurrent backfill
+    /// walk and the live path. Both fold into the same accumulator and both
+    /// flush; `write_days` reads the stored value, merges, and writes it back, so
+    /// without serialization the later commit discards the earlier delta and the
+    /// day silently undercounts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_flushes_do_not_lose_counts() {
+        let db = make_test_db();
+        // Flush on every single message, from every task, to maximise overlap.
+        let idx = Arc::new(DailyStatsIndexer::new(
+            DailyStatsConfig {
+                enabled: true,
+                flush_every_events: 1,
+                flush_interval_secs: 0,
+                ..Default::default()
+            },
+            db,
+        ));
+        let d = date_string_to_day("2026-08-18").unwrap();
+
+        const TASKS: u64 = 4;
+        const PER_TASK: u64 = 50;
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            let idx = idx.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..PER_TASK {
+                    // Distinct fid per task so unique_authors is checkable too.
+                    let fid = t + 1;
+                    idx.process_event(&IndexEvent::message(cast(fid, d, None), 1, i))
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        idx.flush_all().unwrap();
+
+        let rows = idx.range(d, d).unwrap();
+        assert_eq!(
+            rows[0].casts.total,
+            TASKS * PER_TASK,
+            "every folded message must survive concurrent flushes"
+        );
+        assert_eq!(
+            rows[0].casts.unique_authors, TASKS,
+            "set members must survive too — the union is read-modify-write as well"
         );
     }
 
