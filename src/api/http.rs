@@ -85,6 +85,9 @@ pub trait HubQueryHandler: Send + Sync {
         fid_hint: Option<u64>,
     ) -> Option<crate::proto::Message>;
 
+    /// Count live direct replies from the casts-by-parent index.
+    async fn count_direct_replies(&self, fid: u64, hash: &[u8]) -> Result<u64, String>;
+
     /// Get casts by FID with pagination.
     async fn get_casts_by_fid(
         &self,
@@ -1609,9 +1612,15 @@ impl ApiHttpHandler {
             .await
         {
             Ok(conversation) => {
-                let cast_with_replies = self
+                let cast_with_replies = match self
                     .conversation_cast_to_cast_with_replies(&conversation.root)
-                    .await;
+                    .await
+                {
+                    Ok(cast) => cast,
+                    Err(e) => {
+                        return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e))
+                    }
+                };
 
                 let response = ConversationResponse {
                     conversation: Conversation {
@@ -1638,27 +1647,42 @@ impl ApiHttpHandler {
     async fn conversation_cast_to_cast(
         &self,
         conv_cast: &crate::api::conversations::ConversationCast,
-    ) -> Cast {
+    ) -> Result<Cast, String> {
         let mut cast = self.message_to_cast(&conv_cast.cast).await;
-        cast.replies.count = conv_cast.replies.len() as u64;
-        cast
+        self.attach_cast_metrics(&mut cast, &conv_cast.cast.hash);
+        cast.replies.count = self
+            .count_direct_replies(cast.author.fid, &conv_cast.cast.hash)
+            .await?;
+        Ok(cast)
+    }
+
+    async fn count_direct_replies(&self, fid: u64, hash: &[u8]) -> Result<u64, String> {
+        let hub = self
+            .hub_query
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or("Hub query service not available")?;
+        hub.count_direct_replies(fid, hash).await
     }
 
     /// Recursively convert a ConversationCast into CastWithReplies.
     fn conversation_cast_to_cast_with_replies<'a>(
         &'a self,
         conv_cast: &'a crate::api::conversations::ConversationCast,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CastWithReplies> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CastWithReplies, String>> + Send + 'a>,
+    > {
         Box::pin(async move {
-            let cast = self.conversation_cast_to_cast(conv_cast).await;
+            let cast = self.conversation_cast_to_cast(conv_cast).await?;
             let mut direct_replies = Vec::with_capacity(conv_cast.replies.len());
             for reply in &conv_cast.replies {
-                direct_replies.push(self.conversation_cast_to_cast_with_replies(reply).await);
+                direct_replies.push(self.conversation_cast_to_cast_with_replies(reply).await?);
             }
-            CastWithReplies {
+            Ok(CastWithReplies {
                 cast,
                 direct_replies,
-            }
+            })
         })
     }
 
@@ -1989,6 +2013,10 @@ impl ApiHttpHandler {
         if let Some(msg) = hub.get_cast_by_hash(&hash, fid_hint).await {
             let mut cast = self.message_to_cast(&msg).await;
             self.attach_cast_metrics(&mut cast, &msg.hash);
+            cast.replies.count = match hub.count_direct_replies(cast.author.fid, &msg.hash).await {
+                Ok(count) => count,
+                Err(e) => return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)),
+            };
             return Ok(Self::json_response(StatusCode::OK, &CastResponse { cast }));
         }
 
@@ -2022,6 +2050,15 @@ impl ApiHttpHandler {
                 if let Some(msg) = hub.get_cast_by_hash(&hash, fid_hint).await {
                     let mut cast = self.message_to_cast(&msg).await;
                     self.attach_cast_metrics(&mut cast, &msg.hash);
+                    cast.replies.count = match hub
+                        .count_direct_replies(cast.author.fid, &msg.hash)
+                        .await
+                    {
+                        Ok(count) => count,
+                        Err(e) => {
+                            return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e))
+                        }
+                    };
                     casts.push(cast);
                 }
             }
@@ -4613,10 +4650,15 @@ mod tests {
     struct MockHubQuery {
         notifications: Vec<crate::proto::Message>,
         cast_lookup: Option<crate::proto::Message>,
+        direct_reply_count: u64,
     }
 
     #[async_trait]
     impl HubQueryHandler for MockHubQuery {
+        async fn count_direct_replies(&self, _fid: u64, _hash: &[u8]) -> Result<u64, String> {
+            Ok(self.direct_reply_count)
+        }
+
         async fn get_cast_by_hash(
             &self,
             _hash: &[u8],
@@ -4794,9 +4836,15 @@ mod tests {
             .unwrap();
 
         let handler = ApiHttpHandler::new(None, None, Some(metrics), None, None, None);
+        let conversation_cast = crate::api::conversations::ConversationCast {
+            cast: cast.clone(),
+            replies: vec![],
+            depth: 0,
+        };
         handler.set_hub_query(Arc::new(MockHubQuery {
             notifications: vec![],
             cast_lookup: Some(cast),
+            direct_reply_count: 1,
         }));
 
         let response = handler
@@ -4810,6 +4858,25 @@ mod tests {
         assert_eq!(json["cast"]["reactions"]["likes_count"], 2);
         assert_eq!(json["cast"]["reactions"]["recasts_count"], 0);
         assert_eq!(json["cast"]["reactions"]["likes"], serde_json::json!([]));
+        assert_eq!(json["cast"]["replies"]["count"], 1);
+
+        let shallow = handler
+            .conversation_cast_to_cast_with_replies(&conversation_cast)
+            .await
+            .unwrap();
+        assert!(shallow.direct_replies.is_empty());
+        assert_eq!(shallow.cast.replies.count, 1);
+
+        let expanded = crate::api::conversations::ConversationCast {
+            replies: vec![conversation_cast.clone()],
+            ..conversation_cast
+        };
+        let deep = handler
+            .conversation_cast_to_cast_with_replies(&expanded)
+            .await
+            .unwrap();
+        assert_eq!(deep.direct_replies.len(), 1);
+        assert_eq!(deep.cast.replies.count, 1);
     }
 
     #[tokio::test]
@@ -4932,6 +4999,7 @@ mod tests {
         let mock = Arc::new(MockHubQuery {
             notifications: vec![reply_msg.clone(), reaction_msg.clone(), follow_msg.clone()],
             cast_lookup: Some(target_cast_msg),
+            direct_reply_count: 0,
         });
 
         let handler = ApiHttpHandler::new(None, None, None, None, None, None);

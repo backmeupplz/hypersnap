@@ -559,6 +559,25 @@ impl CastStore {
         })
     }
 
+    /// Count live direct replies using the casts-by-parent index without loading messages.
+    pub fn count_casts_by_parent(
+        store: &Store<CastStoreDef>,
+        parent: &Parent,
+    ) -> Result<u64, HubError> {
+        let prefix = CastStoreDef::make_cast_by_parent_key(parent, 0, None);
+        let mut count = 0u64;
+        store.db().for_each_iterator_by_prefix(
+            Some(prefix.to_vec()),
+            Some(increment_vec_u8(&prefix)),
+            &PageOptions::default(),
+            |_, _| {
+                count = count.saturating_add(1);
+                Ok(false)
+            },
+        )?;
+        Ok(count)
+    }
+
     pub fn get_casts_by_mention(
         store: &Store<CastStoreDef>,
         mention: u64,
