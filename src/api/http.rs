@@ -1643,29 +1643,6 @@ impl ApiHttpHandler {
         }
     }
 
-    /// Convert internal conversation cast to Farcaster Cast format.
-    async fn conversation_cast_to_cast(
-        &self,
-        conv_cast: &crate::api::conversations::ConversationCast,
-    ) -> Result<Cast, String> {
-        let mut cast = self.message_to_cast(&conv_cast.cast).await;
-        self.attach_cast_metrics(&mut cast, &conv_cast.cast.hash);
-        cast.replies.count = self
-            .count_direct_replies(cast.author.fid, &conv_cast.cast.hash)
-            .await?;
-        Ok(cast)
-    }
-
-    async fn count_direct_replies(&self, fid: u64, hash: &[u8]) -> Result<u64, String> {
-        let hub = self
-            .hub_query
-            .read()
-            .unwrap()
-            .clone()
-            .ok_or("Hub query service not available")?;
-        hub.count_direct_replies(fid, hash).await
-    }
-
     /// Recursively convert a ConversationCast into CastWithReplies.
     fn conversation_cast_to_cast_with_replies<'a>(
         &'a self,
@@ -1674,7 +1651,9 @@ impl ApiHttpHandler {
         Box<dyn std::future::Future<Output = Result<CastWithReplies, String>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let cast = self.conversation_cast_to_cast(conv_cast).await?;
+            let mut cast = self.message_to_cast(&conv_cast.cast).await;
+            self.attach_cast_metrics(&mut cast, &conv_cast.cast.hash)
+                .await?;
             let mut direct_replies = Vec::with_capacity(conv_cast.replies.len());
             for reply in &conv_cast.replies {
                 direct_replies.push(self.conversation_cast_to_cast_with_replies(reply).await?);
@@ -2012,11 +1991,9 @@ impl ApiHttpHandler {
 
         if let Some(msg) = hub.get_cast_by_hash(&hash, fid_hint).await {
             let mut cast = self.message_to_cast(&msg).await;
-            self.attach_cast_metrics(&mut cast, &msg.hash);
-            cast.replies.count = match hub.count_direct_replies(cast.author.fid, &msg.hash).await {
-                Ok(count) => count,
-                Err(e) => return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)),
-            };
+            if let Err(e) = self.attach_cast_metrics(&mut cast, &msg.hash).await {
+                return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e));
+            }
             return Ok(Self::json_response(StatusCode::OK, &CastResponse { cast }));
         }
 
@@ -2049,16 +2026,9 @@ impl ApiHttpHandler {
                     .and_then(|idx| idx.get_fid_by_hash(&hash));
                 if let Some(msg) = hub.get_cast_by_hash(&hash, fid_hint).await {
                     let mut cast = self.message_to_cast(&msg).await;
-                    self.attach_cast_metrics(&mut cast, &msg.hash);
-                    cast.replies.count = match hub
-                        .count_direct_replies(cast.author.fid, &msg.hash)
-                        .await
-                    {
-                        Ok(count) => count,
-                        Err(e) => {
-                            return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e))
-                        }
-                    };
+                    if let Err(e) = self.attach_cast_metrics(&mut cast, &msg.hash).await {
+                        return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e));
+                    }
                     casts.push(cast);
                 }
             }
@@ -2070,21 +2040,24 @@ impl ApiHttpHandler {
         ))
     }
 
-    /// Attach aggregate engagement data maintained by the metrics indexer.
-    ///
-    /// `message_to_cast` only converts the cast message itself, so endpoints
-    /// that return casts directly must explicitly hydrate these derived fields.
-    fn attach_cast_metrics(&self, cast: &mut Cast, hash: &[u8]) {
-        let Some(metrics) = &self.metrics else {
-            return;
-        };
-        let Ok(metrics) = metrics.get_cast_metrics(cast.author.fid, hash) else {
-            return;
-        };
+    /// Attach indexed reactions and the live direct-reply count. Reply counts
+    /// must not depend on conversation expansion or the metrics indexer's checkpoint.
+    async fn attach_cast_metrics(&self, cast: &mut Cast, hash: &[u8]) -> Result<(), String> {
+        let hub = self
+            .hub_query
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or("Hub query service not available")?;
+        cast.replies.count = hub.count_direct_replies(cast.author.fid, hash).await?;
 
-        cast.reactions.likes_count = metrics.likes;
-        cast.reactions.recasts_count = metrics.recasts;
-        cast.replies.count = metrics.replies;
+        if let Some(metrics) = &self.metrics {
+            if let Ok(metrics) = metrics.get_cast_metrics(cast.author.fid, hash) {
+                cast.reactions.likes_count = metrics.likes;
+                cast.reactions.recasts_count = metrics.recasts;
+            }
+        }
+        Ok(())
     }
 
     /// Handle GET /v2/farcaster/user/bulk-by-address?addresses=0x...,0x...
@@ -4774,7 +4747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cast_lookup_includes_indexed_reaction_counts() {
+    async fn test_cast_counts_do_not_depend_on_reply_expansion() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = Arc::new(crate::storage::db::RocksDB::new(
             temp_dir.path().to_str().unwrap(),
@@ -4866,17 +4839,6 @@ mod tests {
             .unwrap();
         assert!(shallow.direct_replies.is_empty());
         assert_eq!(shallow.cast.replies.count, 1);
-
-        let expanded = crate::api::conversations::ConversationCast {
-            replies: vec![conversation_cast.clone()],
-            ..conversation_cast
-        };
-        let deep = handler
-            .conversation_cast_to_cast_with_replies(&expanded)
-            .await
-            .unwrap();
-        assert_eq!(deep.direct_replies.len(), 1);
-        assert_eq!(deep.cast.replies.count, 1);
     }
 
     #[tokio::test]

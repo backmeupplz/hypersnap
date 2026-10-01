@@ -564,18 +564,11 @@ impl CastStore {
         store: &Store<CastStoreDef>,
         parent: &Parent,
     ) -> Result<u64, HubError> {
+        // TODO: If this O(reply count) scan becomes a bottleneck, maintain counts
+        // when updating the parent index instead. That requires a larger refactor
+        // covering removals, pruning, and backfilling counts for existing data.
         let prefix = CastStoreDef::make_cast_by_parent_key(parent, 0, None);
-        let mut count = 0u64;
-        store.db().for_each_iterator_by_prefix(
-            Some(prefix.to_vec()),
-            Some(increment_vec_u8(&prefix)),
-            &PageOptions::default(),
-            |_, _| {
-                count = count.saturating_add(1);
-                Ok(false)
-            },
-        )?;
-        Ok(count)
+        store.db().count_keys_at_prefix(prefix).map(u64::from)
     }
 
     pub fn get_casts_by_mention(
