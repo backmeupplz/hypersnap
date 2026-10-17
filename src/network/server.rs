@@ -3161,6 +3161,20 @@ impl HubService for MyHubService {
 
 #[tonic::async_trait]
 impl crate::api::HubQueryHandler for MyHubService {
+    async fn count_direct_replies(&self, fid: u64, hash: &[u8]) -> Result<u64, String> {
+        let parent = cast_add_body::Parent::ParentCastId(CastId {
+            fid,
+            hash: hash.to_vec(),
+        });
+        let mut count = 0u64;
+        for stores in self.shard_stores.values() {
+            let shard_count = CastStore::count_casts_by_parent(&stores.cast_store, &parent)
+                .map_err(|e| e.to_string())?;
+            count = count.saturating_add(shard_count);
+        }
+        Ok(count)
+    }
+
     async fn get_cast_by_hash(&self, hash: &[u8], fid_hint: Option<u64>) -> Option<Message> {
         // Fast path: if caller provides the FID (from cast_hash_index), do
         // a single O(1) RocksDB get on the correct shard.

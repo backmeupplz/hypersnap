@@ -559,6 +559,18 @@ impl CastStore {
         })
     }
 
+    /// Count live direct replies using the casts-by-parent index without loading messages.
+    pub fn count_casts_by_parent(
+        store: &Store<CastStoreDef>,
+        parent: &Parent,
+    ) -> Result<u64, HubError> {
+        // TODO: If this O(reply count) scan becomes a bottleneck, maintain counts
+        // when updating the parent index instead. That requires a larger refactor
+        // covering removals, pruning, and backfilling counts for existing data.
+        let prefix = CastStoreDef::make_cast_by_parent_key(parent, 0, None);
+        store.db().count_keys_at_prefix(prefix).map(u64::from)
+    }
+
     pub fn get_casts_by_mention(
         store: &Store<CastStoreDef>,
         mention: u64,

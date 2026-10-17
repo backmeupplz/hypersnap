@@ -553,6 +553,10 @@ mod tests {
         let result = CastStore::get_casts_by_parent(&store, &parent, &page_options).unwrap();
 
         assert_eq!(result.messages, vec![cast1.clone(), cast2.clone()]);
+        assert_eq!(
+            CastStore::count_casts_by_parent(&store, &parent).unwrap(),
+            2
+        );
         assert!(result.next_page_token.is_none());
 
         // Test pagination
@@ -1529,6 +1533,10 @@ mod tests {
         let parent_result =
             CastStore::get_casts_by_parent(&store, &parent, &PageOptions::default());
         assert_eq!(parent_result.unwrap().messages.len(), 0);
+        assert_eq!(
+            CastStore::count_casts_by_parent(&store, &parent).unwrap(),
+            0
+        );
 
         // Verify cast is no longer found by mention
         let mention_result =
