@@ -1,4 +1,5 @@
 use super::{
+    index_read::{get_union_index_value, index_roots},
     make_fid_key, make_user_key_with_prefix,
     message::{read_fid_key, FID_BYTES},
     store::{Store, StoreDef},
@@ -386,7 +387,16 @@ impl VerificationStore {
         address: &[u8],
     ) -> Result<Option<u64>, HubError> {
         let key = VerificationStoreDef::make_verification_by_address_key(address);
-        let result = store.db().get(&key)?;
+        let ctx = store.state_context();
+        let result = get_union_index_value(
+            &store.db(),
+            None,
+            &index_roots(
+                ctx.root_prefix(RootPrefix::VerificationByAddress),
+                RootPrefix::VerificationByAddress as u8,
+            ),
+            &key[1..],
+        )?;
 
         if let Some(value) = result {
             if value.len() >= FID_BYTES {

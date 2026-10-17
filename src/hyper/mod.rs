@@ -1,4 +1,5 @@
 pub mod backfill;
+pub mod reconcile;
 
 use crate::proto;
 use crate::storage::constants::RootPrefix;

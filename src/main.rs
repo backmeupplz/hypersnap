@@ -91,7 +91,8 @@ async fn start_servers(
         })
         .collect();
 
-    // Spawn hyper backfill to populate shadow stores from historical blocks
+    // Spawn hyper backfill to populate shadow stores from historical blocks,
+    // then reconcile them against the legacy stores for anything replay missed.
     {
         let backfill_db = block_stores.db.clone();
         let backfill_shard_stores = shard_stores.clone();
@@ -103,6 +104,24 @@ async fn start_servers(
                 &backfill_hyper_stores,
             )
             .await;
+            let cast_hash = snapchain::api::cast_hash_index::CastHashIndexer::new(
+                snapchain::api::config::FeatureConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                backfill_db.clone(),
+            );
+            let reconcile = tokio::task::spawn_blocking(move || {
+                snapchain::hyper::reconcile::run_hyper_reconcile(
+                    &backfill_db,
+                    &backfill_shard_stores,
+                    &backfill_hyper_stores,
+                    &cast_hash,
+                );
+            });
+            if let Err(e) = reconcile.await {
+                warn!(error = %e, "Hyper reconciliation task failed");
+            }
         });
     }
 
@@ -198,6 +217,7 @@ async fn start_servers(
                 metrics,
                 api_service.clone(),
             ));
+            feeds.warm_trending();
             handler.set_feeds(feeds.clone());
             handler.set_channel_feeds(feeds);
         }

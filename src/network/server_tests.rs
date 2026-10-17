@@ -1348,6 +1348,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_cast_by_hash() {
+        use crate::api::HubQueryHandler;
+
+        let (
+            _stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+        let engine1 = &mut engine1;
+        let engine2 = &mut engine2;
+        test_helper::register_user(
+            SHARD1_FID,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            engine1,
+        )
+        .await;
+        test_helper::register_user(
+            SHARD2_FID,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            engine2,
+        )
+        .await;
+        let cast1 = messages_factory::casts::create_cast_add(SHARD1_FID, "one", None, None);
+        let removed = messages_factory::casts::create_cast_add(SHARD1_FID, "gone", None, None);
+        let remove = messages_factory::casts::create_cast_remove(
+            SHARD1_FID,
+            &removed.hash,
+            Some(removed.data.as_ref().unwrap().timestamp + 10),
+            None,
+        );
+        let cast2 = messages_factory::casts::create_cast_add(SHARD2_FID, "two", None, None);
+        test_helper::commit_message(engine1, &cast1).await;
+        test_helper::commit_message(engine1, &removed).await;
+        test_helper::commit_message(engine1, &remove).await;
+        test_helper::commit_message(engine2, &cast2).await;
+
+        let found = |msg: Option<proto::Message>| msg.map(|m| m.hash);
+
+        // With the author FID, a direct lookup.
+        assert_eq!(
+            found(
+                service
+                    .get_cast_by_hash(&cast1.hash, Some(SHARD1_FID))
+                    .await
+            ),
+            Some(cast1.hash.clone())
+        );
+        // A hash binds its author, so a wrong FID is a miss, not a probe.
+        assert!(service
+            .get_cast_by_hash(&cast2.hash, Some(SHARD1_FID))
+            .await
+            .is_none());
+
+        // Without an FID, the probe finds casts on either shard.
+        assert_eq!(
+            found(service.get_cast_by_hash(&cast1.hash, None).await),
+            Some(cast1.hash.clone())
+        );
+        assert_eq!(
+            found(service.get_cast_by_hash(&cast2.hash, None).await),
+            Some(cast2.hash.clone())
+        );
+
+        // Removed, unknown and truncated hashes resolve to nothing.
+        assert!(service
+            .get_cast_by_hash(&removed.hash, None)
+            .await
+            .is_none());
+        assert!(service.get_cast_by_hash(&[0u8; 20], None).await.is_none());
+        assert!(service
+            .get_cast_by_hash(&cast1.hash[..4], None)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_conversation_keeps_replies_past_reply_limit() {
+        let (
+            _stores,
+            _senders,
+            [mut engine1, _engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+        let engine1 = &mut engine1;
+        test_helper::register_user(
+            SHARD1_FID,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            engine1,
+        )
+        .await;
+        // Replies come from a second shard-1 FID: test stores keep 4 casts per FID.
+        let replier = SHARD1_FID + 2;
+        test_helper::register_user(
+            replier,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            engine1,
+        )
+        .await;
+        let root = messages_factory::casts::create_cast_add(SHARD1_FID, "root", None, None);
+        test_helper::commit_message(engine1, &root).await;
+        let timestamp = root.data.as_ref().unwrap().timestamp;
+        let parent = proto::cast_add_body::Parent::ParentCastId(proto::CastId {
+            fid: SHARD1_FID,
+            hash: root.hash.clone(),
+        });
+        let mut replies = vec![];
+        for i in 0..3u32 {
+            replies.push(messages_factory::casts::create_cast_add_rich(
+                replier,
+                &format!("reply {}", i),
+                None,
+                vec![],
+                Some(parent.clone()),
+                vec![],
+                Some(timestamp + 1 + i),
+                None,
+            ));
+        }
+        test_helper::commit_messages(engine1, replies.clone()).await;
+
+        let conversations = crate::api::ConversationService::new(
+            crate::api::config::ConversationConfig {
+                enabled: true,
+                max_depth: 5,
+                max_replies: 2,
+            },
+            Arc::new(service),
+        );
+        let conversation = conversations
+            .get_conversation(SHARD1_FID, &root.hash, None)
+            .await
+            .unwrap();
+        // More direct replies than the limit: the oldest two, not none.
+        let got: Vec<_> = conversation
+            .root
+            .replies
+            .iter()
+            .map(|r| r.cast.hash.clone())
+            .collect();
+        let expected: Vec<_> = replies[..2].iter().map(|r| r.hash.clone()).collect();
+        assert_eq!(got, expected);
+        assert_eq!(conversation.total_replies, 2);
+    }
+
+    #[tokio::test]
     async fn test_get_casts_by_parent_hash() {
         let (
             _stores,

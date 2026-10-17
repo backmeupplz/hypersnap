@@ -41,8 +41,8 @@ use crate::storage::store::account::MessagesPage;
 use crate::storage::store::account::UsernameProofStore;
 use crate::storage::store::account::{
     get_app_nonce, get_gasless_key_count, get_gasless_key_record, get_last_used_at, get_user_nonce,
-    list_gasless_keys_by_fid, CastStore, GaslessKeyRecord, LinkStore, ReactionStore, UserDataStore,
-    VerificationStore,
+    list_gasless_keys_by_fid, CastStore, CastStoreDef, GaslessKeyRecord, LinkStore, ReactionStore,
+    UserDataStore, VerificationStore, HASH_LENGTH,
 };
 use crate::storage::store::account::{message_bytes_decode, IntoI32};
 use crate::storage::store::account::{EventsPage, HubEventIdGenerator};
@@ -60,6 +60,7 @@ use moka::sync::{Cache, CacheBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -71,6 +72,23 @@ use tracing::{debug, error, info};
 
 pub const MEMPOOL_ADD_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Threads used to probe FIDs in parallel when resolving a cast by hash alone.
+const CAST_SCAN_THREADS: u64 = 8;
+/// Cast-adds keys per multi-get while probing FIDs for a cast hash.
+const CAST_SCAN_BATCH: usize = 1024;
+
+/// Run a synchronous, long-running closure from async code without starving
+/// the other tasks on this runtime worker. Falls back to a direct call on a
+/// current-thread runtime, where `block_in_place` is unavailable.
+fn run_blocking<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
 
 // Time budget for recovering from a `MissingFname` validation failure on UserDataAdd
 // Username messages.
@@ -1159,6 +1177,102 @@ impl MyHubService {
                 Err(Status::not_found("username proof not found"))
             }
             _ => Err(Status::invalid_argument("unsupported name type")),
+        }
+    }
+
+    /// Find the author FID of a cast from its hash alone. The shard stores
+    /// have no hash-keyed index, so this probes the cast-adds key of every
+    /// FID up to the highest registered one, in batched multi-gets across
+    /// scoped threads, stopping as soon as any thread finds the cast.
+    fn find_cast_fid_by_hash(&self, hash: &[u8]) -> Option<u64> {
+        if hash.len() != HASH_LENGTH {
+            return None;
+        }
+        // IdRegister events are keyed by FID, so the last page in reverse
+        // order holds the highest registered FIDs.
+        let max_fid = self
+            .shard_stores
+            .values()
+            .filter_map(|stores| {
+                stores
+                    .onchain_event_store
+                    .get_fids(&PageOptions {
+                        page_size: Some(64),
+                        page_token: None,
+                        reverse: true,
+                    })
+                    .ok()
+            })
+            .flat_map(|(fids, _)| fids)
+            .max()?;
+
+        let hash = hash.to_vec();
+        let found = AtomicU64::new(0);
+        let span = max_fid.div_ceil(CAST_SCAN_THREADS);
+        std::thread::scope(|scope| {
+            for i in 0..CAST_SCAN_THREADS {
+                let (hash, found) = (&hash, &found);
+                let start = 1 + i * span;
+                let end = ((i + 1) * span).min(max_fid);
+                scope.spawn(move || self.scan_cast_adds_range(hash, start, end, found));
+            }
+        });
+        match found.load(Ordering::Relaxed) {
+            0 => None,
+            fid => Some(fid),
+        }
+    }
+
+    /// Probe the cast-adds key for `hash` under each FID in `start..=end`,
+    /// recording the owning FID in `found`. Returns early once any scanner
+    /// has set `found`.
+    fn scan_cast_adds_range(&self, hash: &Vec<u8>, start: u64, end: u64, found: &AtomicU64) {
+        let probe = |shard_id: u32, fids: &[u64], keys: &Vec<Vec<u8>>| -> Option<u64> {
+            let stores = self.shard_stores.get(&shard_id)?;
+            let values = stores.cast_store.db().get_many(keys).ok()?;
+            values
+                .iter()
+                .position(|v| !v.is_empty())
+                .map(|idx| fids[idx])
+        };
+
+        let mut batches: HashMap<u32, (Vec<u64>, Vec<Vec<u8>>)> = HashMap::new();
+        for fid in start..=end {
+            if found.load(Ordering::Relaxed) != 0 {
+                return;
+            }
+            let shard_id = self.message_router.route_fid(fid, self.num_shards);
+            let Some(stores) = self.shard_stores.get(&shard_id) else {
+                continue;
+            };
+            let root_prefix = stores
+                .cast_store
+                .state_context()
+                .root_prefix(RootPrefix::User);
+            let (fids, keys) = batches.entry(shard_id).or_default();
+            fids.push(fid);
+            keys.push(CastStoreDef::make_cast_adds_key_with_prefix(
+                root_prefix,
+                fid,
+                hash,
+            ));
+            if keys.len() >= CAST_SCAN_BATCH {
+                if let Some(owner) = probe(shard_id, fids, keys) {
+                    found.store(owner, Ordering::Relaxed);
+                    return;
+                }
+                fids.clear();
+                keys.clear();
+            }
+        }
+        for (shard_id, (fids, keys)) in &batches {
+            if keys.is_empty() || found.load(Ordering::Relaxed) != 0 {
+                continue;
+            }
+            if let Some(owner) = probe(*shard_id, fids, keys) {
+                found.store(owner, Ordering::Relaxed);
+                return;
+            }
         }
     }
 
@@ -3176,49 +3290,17 @@ impl crate::api::HubQueryHandler for MyHubService {
     }
 
     async fn get_cast_by_hash(&self, hash: &[u8], fid_hint: Option<u64>) -> Option<Message> {
-        // Fast path: if caller provides the FID (from cast_hash_index), do
-        // a single O(1) RocksDB get on the correct shard.
-        if let Some(fid) = fid_hint {
-            if let Ok(stores) = self.get_stores_for(fid) {
-                if let Ok(Some(msg)) =
-                    CastStore::get_cast_add(&stores.cast_store, fid, hash.to_vec())
-                {
-                    return Some(msg);
-                }
-            }
-        }
-
-        // Slow fallback: scan all shards. Only reached when no FID hint
-        // is available (e.g. cast_hash_index hasn't backfilled yet).
-        for stores in self.shard_stores.values() {
-            let mut page_token: Option<Vec<u8>> = None;
-            loop {
-                let page_options = PageOptions {
-                    page_size: Some(1000),
-                    page_token: page_token.clone(),
-                    reverse: false,
-                };
-                let (fids, next_token) = match stores.onchain_event_store.get_fids(&page_options) {
-                    Ok(result) => result,
-                    Err(_) => break,
-                };
-                if fids.is_empty() {
-                    break;
-                }
-                for fid in &fids {
-                    if let Ok(Some(msg)) =
-                        CastStore::get_cast_add(&stores.cast_store, *fid, hash.to_vec())
-                    {
-                        return Some(msg);
-                    }
-                }
-                match next_token {
-                    Some(token) if !token.is_empty() => page_token = Some(token),
-                    _ => break,
-                }
-            }
-        }
-        None
+        // A message hash commits to its author FID, so with a known FID the
+        // cast can only live at one key. A miss there means it was removed,
+        // pruned or never existed; probing other FIDs cannot find it.
+        let fid = match fid_hint {
+            Some(fid) => fid,
+            None => run_blocking(|| self.find_cast_fid_by_hash(hash))?,
+        };
+        let stores = self.get_stores_for(fid).ok()?;
+        CastStore::get_cast_add(&stores.cast_store, fid, hash.to_vec())
+            .ok()
+            .flatten()
     }
 
     async fn get_casts_by_fid(
@@ -3335,7 +3417,7 @@ impl crate::api::HubQueryHandler for MyHubService {
         None
     }
 
-    async fn get_fids_by_address(&self, address: &[u8]) -> Vec<u64> {
+    async fn get_fids_by_address(&self, address: &[u8], include_custody: bool) -> Vec<u64> {
         let mut fids = Vec::new();
 
         // Check verifications first (direct RocksDB lookup, O(1) per shard)
@@ -3352,7 +3434,7 @@ impl crate::api::HubQueryHandler for MyHubService {
         // Check ID registry for custody address (uses a cache, but the
         // initial population scans all id register events and can be slow).
         // Skip if we already found matches via verifications.
-        if fids.is_empty() {
+        if include_custody && fids.is_empty() {
             if let Ok(Some(event)) = self.find_id_registry_event_by_address(address) {
                 if let Some(Body::IdRegisterEventBody(body)) = &event.body {
                     if body.to == address && !fids.contains(&event.fid) {

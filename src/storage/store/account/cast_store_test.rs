@@ -7,7 +7,8 @@ mod tests {
     use crate::proto::{self as message, hub_event, CastType, HubEvent, HubEventType};
     use crate::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch};
     use crate::storage::store::account::{
-        CastStore, CastStoreDef, HubEventStorageExt, Store, StoreEventHandler, StoreOptions,
+        CastStore, CastStoreDef, HubEventStorageExt, MessagesPage, Store, StoreEventHandler,
+        StoreOptions,
     };
     use crate::utils::factory::{messages_factory, time};
     use std::sync::Arc;
@@ -1683,6 +1684,113 @@ mod tests {
         let hyper_second =
             CastStore::get_cast_add(&hyper_store, FID_FOR_TEST, second.hash.clone()).unwrap();
         assert!(hyper_second.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_hyper_casts_by_parent_spans_legacy_and_hyper_indexes() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db = RocksDB::new(temp_dir.path().join("test.db").to_str().unwrap());
+        db.open().unwrap();
+        let db = Arc::new(db);
+        let event_handler = StoreEventHandler::new();
+        let legacy_store = Store::new_with_store_def_ctx(
+            db.clone(),
+            event_handler.clone(),
+            CastStoreDef::new(100),
+            StoreOptions::default(),
+            StateContext::Legacy,
+        );
+        let hyper_store = Store::new_with_store_def_ctx(
+            db.clone(),
+            event_handler.clone(),
+            CastStoreDef::new(100),
+            StoreOptions::default(),
+            StateContext::Hyper,
+        );
+
+        let parent = Parent::ParentCastId(message::CastId {
+            fid: 1234,
+            hash: vec![7; 20],
+        });
+        let timestamp = time::farcaster_time();
+        let reply = |text: &str, offset: u32| {
+            messages_factory::casts::create_cast_add_rich(
+                FID_FOR_TEST,
+                text,
+                Some(CastType::Cast),
+                vec![],
+                Some(parent.clone()),
+                vec![],
+                Some(timestamp + offset),
+                None,
+            )
+        };
+        let legacy_only = reply("legacy only", 0);
+        let both = reply("both", 1);
+        let hyper_only = reply("hyper only", 2);
+        merge_messages(&legacy_store, &db, vec![&legacy_only, &both]);
+        merge_messages(&hyper_store, &db, vec![&both, &hyper_only]);
+
+        let hashes = |page: &MessagesPage| -> Vec<Vec<u8>> {
+            page.messages.iter().map(|m| m.hash.clone()).collect()
+        };
+
+        // Legacy reads only the legacy index.
+        let legacy_page =
+            CastStore::get_casts_by_parent(&legacy_store, &parent, &PageOptions::default())
+                .unwrap();
+        assert_eq!(
+            hashes(&legacy_page),
+            vec![legacy_only.hash.clone(), both.hash.clone()]
+        );
+
+        // Hyper reads the union, in index order, without duplicates.
+        let all =
+            CastStore::get_casts_by_parent(&hyper_store, &parent, &PageOptions::default()).unwrap();
+        assert_eq!(
+            hashes(&all),
+            vec![
+                legacy_only.hash.clone(),
+                both.hash.clone(),
+                hyper_only.hash.clone()
+            ]
+        );
+        assert!(all.next_page_token.is_none());
+        assert_eq!(
+            CastStore::count_casts_by_parent(&hyper_store, &parent).unwrap(),
+            3
+        );
+
+        // Pagination resumes across both indexes, in either direction.
+        for reverse in [false, true] {
+            let mut expected = hashes(&all);
+            if reverse {
+                expected.reverse();
+            }
+            let first = CastStore::get_casts_by_parent(
+                &hyper_store,
+                &parent,
+                &PageOptions {
+                    page_size: Some(2),
+                    page_token: None,
+                    reverse,
+                },
+            )
+            .unwrap();
+            assert_eq!(hashes(&first), expected[..2].to_vec());
+            let second = CastStore::get_casts_by_parent(
+                &hyper_store,
+                &parent,
+                &PageOptions {
+                    page_size: Some(2),
+                    page_token: first.next_page_token.clone(),
+                    reverse,
+                },
+            )
+            .unwrap();
+            assert_eq!(hashes(&second), expected[2..].to_vec());
+            assert!(second.next_page_token.is_none());
+        }
     }
 
     #[tokio::test]

@@ -1388,6 +1388,7 @@ impl ShardEngine {
                 _ => Ok(()),
             };
             if let Err(e) = result {
+                self.metrics.count("hyper.merge_failed", 1, vec![]);
                 warn!(shard_id = self.shard_id, error = %e, "hyper merge failed");
             }
         }

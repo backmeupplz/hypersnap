@@ -1,6 +1,8 @@
 use super::{
-    get_many_messages, make_cast_id_key, make_fid_key, make_message_primary_key,
-    make_user_key_with_prefix, read_fid_key, read_ts_hash,
+    get_many_messages,
+    index_read::{get_union_index_page, index_roots},
+    make_cast_id_key, make_fid_key, make_message_primary_key, make_user_key_with_prefix,
+    read_fid_key, read_ts_hash,
     store::{Store, StoreDef},
     MessagesPage, StoreEventHandler, PAGE_SIZE_MAX, TS_HASH_LENGTH,
 };
@@ -444,6 +446,25 @@ impl ReactionStore {
         page_options: &PageOptions,
     ) -> Result<MessagesPage, HubError> {
         let start_prefix = ReactionStoreDef::make_reactions_by_target_key(target, 0, None);
+        let ctx = store.state_context();
+        if ctx.is_hyper() {
+            return get_union_index_page(
+                &store.db(),
+                &index_roots(
+                    ctx.root_prefix(RootPrefix::ReactionsByTarget),
+                    RootPrefix::ReactionsByTarget as u8,
+                ),
+                &index_roots(ctx.root_prefix(RootPrefix::User), RootPrefix::User as u8),
+                &start_prefix[1..],
+                store.postfix(),
+                page_options,
+                page_options.page_size.unwrap_or(PAGE_SIZE_MAX),
+                |value| {
+                    reaction_type == ReactionType::None as i32
+                        || (value.len() == 1 && value[0] == reaction_type as u8)
+                },
+            );
+        }
 
         let mut message_keys = vec![];
         let mut last_key = vec![];

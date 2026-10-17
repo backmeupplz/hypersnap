@@ -19,6 +19,7 @@ pub use self::verification_store::*;
 
 mod cast_store;
 mod event;
+mod index_read;
 mod link_store;
 mod message;
 mod onchain_event_store;
