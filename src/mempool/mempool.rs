@@ -509,11 +509,11 @@ impl ReadNodeMempool {
         let fid_shard = self
             .message_router
             .route_fid(message.fid(), self.num_shards);
+        let version = EngineVersion::current(self.network);
 
         // Fname transfers are mirrored to both the sender and receiver shard.
         match message {
             MempoolMessage::FnameTransfer(_fname_transfer) => {
-                let version = EngineVersion::current(self.network);
                 // Send the username transfer to all other shards, transfers from a->b->c are
                 // correctly tracked. Due to current limitations of the engine, if we transfer from
                 // shard 1 to shard 2, and then transfer within shard 2, we will keep the transfer
@@ -543,6 +543,7 @@ impl ReadNodeMempool {
                     &self.message_router,
                     message,
                     self.num_shards,
+                    version,
                 )]
             }
         }
@@ -701,6 +702,8 @@ impl Mempool {
                 // re-propagation when over limit. KEY_REMOVE is intentionally NEVER rate-limited:
                 // revocation of a compromised key must not be blockable. Non-key user messages
                 // fall through to the storage-quota limiter below.
+                // TODO(#10): this is also the hook for lazy `registration_tx_hash` replacement
+                // eviction — wire in once the pending-FID flow lands.
                 if is_key_add(user_msg) {
                     if !self.key_add_rate_limits.consume_for_fid(fid) {
                         self.statsd_client
@@ -777,9 +780,25 @@ impl Mempool {
         message: &MempoolMessage,
         at_admission: bool,
     ) -> Result<(), HubError> {
-        // Pre-feature admission gate for KEY_ADD / KEY_REMOVE.
+        // Pre-feature admission gate for KEY_ADD / KEY_REMOVE. Provisional until
+        // NEYN-10619 consolidates feature-gating into a single validate_user_message
+        // hook at mempool admission.
         if let MempoolMessage::UserMessage(user_msg) = message {
             let msg_type = user_msg.msg_type();
+            if matches!(
+                msg_type,
+                MessageType::ChannelUpdate
+                    | MessageType::ChannelMember
+                    | MessageType::ChannelPin
+                    | MessageType::ChannelModerate
+            ) {
+                let version = EngineVersion::current(self.read_node_mempool.network);
+                if !version.is_enabled(ProtocolFeature::ChannelMessages) {
+                    return Err(HubError::validation_failure(
+                        "channel messages not yet active",
+                    ));
+                }
+            }
             if matches!(msg_type, MessageType::KeyAdd | MessageType::KeyRemove) {
                 let version = EngineVersion::current(self.read_node_mempool.network);
                 if !version.is_enabled(ProtocolFeature::GaslessSigners) {
@@ -808,8 +827,11 @@ impl Mempool {
         if self.message_already_exists(shard, message) {
             return Err(HubError::duplicate("message has already been merged"));
         }
-        // Rate-limit checks are token-consuming. Run only at admission; re-running
-        // at pull time would double-charge the 1/min KEY_ADD quota.
+        // Rate-limit checks are token-consuming (the KEY_ADD limiter uses
+        // `governor::RateLimiter::check`, which decrements the bucket). They must run
+        // exactly once, at admission. Re-running them at pull time would double-charge
+        // the 1/min KEY_ADD quota and silently drop every accepted message before it
+        // ever reached the engine.
         if at_admission && self.message_exceeds_rate_limits(message) {
             self.statsd_client
                 .count_with_shard(shard, "mempool.rate_limit_hit", 1, vec![]);
@@ -930,12 +952,20 @@ impl Mempool {
         match self.messages.get_mut(&shard_id) {
             Some(shard_messages) => {
                 if shard_messages.contains_key(&message.mempool_key()) {
+                    // Exit early if the message already exists in the mempool
                     return Err(HubError::duplicate("message already in the mempool"));
                 }
             }
             None => {}
         }
 
+        // TODO(topocount): Maybe we don't need to run validations here? Related: rate-limit
+        // checks (the only token-consuming part of `message_is_valid`) should ideally be
+        // pulled out of `message_is_valid` entirely and run once, inline at this admission
+        // entry point. That would let `pull_messages` drop the `at_admission` flag and call
+        // a pure idempotent `message_is_valid` with no risk of accidentally re-charging the
+        // limiter. The flag exists today as the minimal-surgery fix; the cleaner split is
+        // deferred until the surrounding admission validations are reworked.
         // FIP-268 LIVE_AT mempool parity with upstream snapchain
         // (farcasterxyz/snapchain#899, c292bfd): the old pending
         // LIVE_AT must be evicted ONLY in the `result.is_ok()`
@@ -943,7 +973,6 @@ impl Mempool {
         // (feature gate, post-merge duplicate, rate limit) must
         // not displace the prior pending one.
         let live_at_to_replace = self.prepare_live_at_insert(shard_id, &message)?;
-
         let result = self.message_is_valid(shard_id, &message, true);
         if result.is_ok() {
             if let Some(old_key) = live_at_to_replace {

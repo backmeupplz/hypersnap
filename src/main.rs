@@ -9,6 +9,8 @@ use snapchain::consensus::consensus::SystemMessage;
 use snapchain::core::types::SnapchainValidatorContext;
 use snapchain::hyper as snapchain_hyper;
 use snapchain::mempool::block_receiver::BlockReceiver;
+use snapchain::mempool::l1_gate::GossipL1Gate;
+use snapchain::mempool::l1_validator::L1Validator;
 use snapchain::mempool::mempool::{Mempool, MempoolRequest, ReadNodeMempool};
 use snapchain::mempool::routing;
 use snapchain::network::admin_server::MyAdminService;
@@ -34,6 +36,7 @@ use std::error::Error;
 use std::net::SocketAddr;
 use std::process;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{fs, net};
 use tokio::net::TcpListener;
 use tokio::select;
@@ -58,7 +61,7 @@ async fn start_servers(
     shard_stores: HashMap<u32, Stores>,
     shard_senders: HashMap<u32, Senders>,
     block_stores: BlockStores,
-    chain_clients: ChainClients,
+    l1_validator: Arc<L1Validator>,
     replicator: Option<Arc<replication::replicator::Replicator>>,
     local_state_store: LocalStateStore,
     api_handler: Option<snapchain::api::ApiHttpHandler>,
@@ -155,10 +158,11 @@ async fn start_servers(
         Box::new(routing::ShardRouter {}),
         mempool_tx.clone(),
         gossip_tx.clone(),
-        chain_clients,
+        l1_validator.clone(),
         VERSION.unwrap_or("unknown").to_string(),
         local_peer_id.to_string(),
         fname_lookup.clone(),
+        app_config.mesh.clone(),
     ));
 
     // Create a separate API service backed by hyper (un-pruned) stores.
@@ -177,12 +181,11 @@ async fn start_servers(
         Box::new(routing::ShardRouter {}),
         mempool_tx.clone(),
         gossip_tx.clone(),
-        ChainClients {
-            chain_api_map: HashMap::new(),
-        },
+        l1_validator,
         VERSION.unwrap_or("unknown").to_string(),
         local_peer_id.to_string(),
         fname_lookup,
+        app_config.mesh.clone(),
     ));
 
     // Wire late-bound API handlers that depend on the hub service
@@ -328,6 +331,15 @@ async fn start_servers(
 
     let http_shutdown_tx = shutdown_tx.clone();
     let http_server_config = app_config.http_server.clone();
+    // Built once and shared across all connections — maps peers to human-readable
+    // names for the mesh JSON / UI.
+    let mesh_nodes = Arc::new(snapchain::network::mesh::nodes::NodeRegistry::from_config(
+        &app_config.mesh,
+    ));
+    info!(
+        known_nodes = mesh_nodes.len(),
+        "Mesh known-node registry loaded"
+    );
     tokio::spawn(async move {
         let listener = TcpListener::bind(http_socket_addr).await.unwrap();
         info!(http_addr = http_addr, "HttpService listening",);
@@ -342,9 +354,10 @@ async fn start_servers(
                     let http_server_config = http_server_config.clone();
                     let service_clone = http_service.clone();
                     let api = api_handler.clone();
+                    let nodes = mesh_nodes.clone();
                     tokio::spawn(async move {
                         let mut router =
-                            snapchain::network::http_server::Router::new(service_clone);
+                            snapchain::network::http_server::Router::new(service_clone, nodes);
                         if let Some(handler) = api {
                             router = router.with_api_handler(handler);
                         }
@@ -473,8 +486,76 @@ fn create_replicator(
 
     Ok(Arc::new(replicator))
 }
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+/// How long shutdown waits for the API indexing system to stop.
+const API_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the runtime waits for blocking-pool work after `run` returns.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    // The hyper reconcile and the API backfills run on the blocking pool for hours with
+    // no cancellation point, and dropping a runtime waits for blocking tasks. Bound the
+    // wait so a SIGTERM finishes inside the supervisor's grace period (docker: 10s)
+    // instead of ending in SIGKILL.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    result
+}
+
+/// Resolves on Ctrl-C (SIGINT) or SIGTERM and names the signal. Docker and most
+/// process supervisors stop a node with SIGTERM.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => select! {
+                _ = ctrl_c() => "SIGINT",
+                _ = sigterm.recv() => "SIGTERM",
+            },
+            Err(e) => {
+                warn!(error = %e, "Could not install a SIGTERM handler; only Ctrl-C shuts down cleanly");
+                let _ = ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c().await;
+        "SIGINT"
+    }
+}
+
+/// Has the gossip task close every peer connection before the process exits. Without
+/// it each peer holds a dead connection until its QUIC idle timeout, and a node that
+/// restarts inside that window never receives the peers' gossip subscriptions.
+async fn close_gossip_connections(
+    gossip_tx: &mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
+) {
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    if gossip_tx.send(GossipEvent::Shutdown(done_tx)).await.is_ok() {
+        // The gossip task bounds its own wait; this only guards a stalled task.
+        let _ = tokio::time::timeout(
+            snapchain::network::gossip::SHUTDOWN_CLOSE_TIMEOUT + Duration::from_secs(1),
+            done_rx,
+        )
+        .await;
+    }
+}
+
+async fn shut_down_api(api: snapchain::api::ApiSystem) {
+    if tokio::time::timeout(API_SHUTDOWN_TIMEOUT, api.shutdown())
+        .await
+        .is_err()
+    {
+        warn!("API indexing system did not stop in time");
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
 
     let app_config = match snapchain::cfg::load_and_merge_config(args) {
@@ -499,23 +580,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    if app_config.clear_db {
-        let db_dir = format!("{}", app_config.rocksdb_dir);
-        if std::path::Path::new(&db_dir).exists() {
-            let remove_result = std::fs::remove_dir_all(db_dir.clone());
-            if let Err(e) = remove_result {
-                error!("Failed to clear db at {:?}: {}", db_dir, e);
-            }
-            let create_result = std::fs::create_dir_all(db_dir.clone());
-            if let Err(e) = create_result {
-                error!("Failed to create db dir at {:?}: {}", db_dir, e);
-            }
-            warn!("Cleared db at {:?}", db_dir);
-        } else {
-            warn!("No db to clear at {:?}", db_dir);
-        }
-    }
-
     if app_config.statsd.prefix == "" {
         // TODO: consider removing this check
         return Err("statsd prefix must be specified in config".into());
@@ -533,6 +597,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
             app_config.statsd.addr
         )),
     }?;
+
+    // Deploy scripts run `snapchain --check-config` between rewriting config.toml
+    // (fc config pull) and restarting the node, so a bad config fails here — before
+    // the running node is stopped — rather than as a crash loop after. Placed after
+    // the log_format and statsd checks so everything main() itself validates
+    // pure-config (no side effects) is covered; --clear-db stays behind the gate,
+    // since a validation run must never touch the database. Note the gate is
+    // otherwise loader-deep only — values that panic later in startup (e.g. a
+    // malformed consensus.private_key) are not exercised here.
+    if app_config.check_config {
+        println!("config OK");
+        return Ok(());
+    }
+
+    if app_config.clear_db {
+        let db_dir = format!("{}", app_config.rocksdb_dir);
+        if std::path::Path::new(&db_dir).exists() {
+            let remove_result = std::fs::remove_dir_all(db_dir.clone());
+            if let Err(e) = remove_result {
+                error!("Failed to clear db at {:?}: {}", db_dir, e);
+            }
+            let create_result = std::fs::create_dir_all(db_dir.clone());
+            if let Err(e) = create_result {
+                error!("Failed to create db dir at {:?}: {}", db_dir, e);
+            }
+            warn!("Cleared db at {:?}", db_dir);
+        } else {
+            warn!("No db to clear at {:?}", db_dir);
+        }
+    }
 
     // Resolving the statsd host can fail transiently at boot, e.g. when the metrics
     // container hasn't registered with the DNS resolver yet. Retry for a bounded
@@ -866,6 +960,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
         let api_search_indexer = api_system.as_ref().and_then(|s| s.search_indexer.clone());
 
+        let l1_validator = Arc::new(L1Validator::new(
+            chains_clients,
+            node.shard_stores.clone(),
+            Box::new(routing::ShardRouter {}),
+            app_config.consensus.num_shards,
+            app_config.fc_network,
+            app_config.l1_gate.cache_config(),
+        ));
+
         start_servers(
             &app_config,
             gossip_tx.clone(),
@@ -878,7 +981,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             node.shard_stores.clone(),
             node.shard_senders.clone(),
             node.block_stores.clone(),
-            chains_clients,
+            l1_validator,
             replicator,
             local_state_store.clone(),
             api_handler,
@@ -887,20 +990,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await;
 
         let mut shards_finished_syncing = HashSet::new();
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
         loop {
             select! {
-                _ = ctrl_c() => {
-                    info!("Received Ctrl-C, shutting down");
+                signal = &mut shutdown => {
+                    info!(signal, "Received shutdown signal, shutting down");
+                    close_gossip_connections(&gossip_tx).await;
                     if let Some(api) = api_system {
-                        api.shutdown().await;
+                        shut_down_api(api).await;
                     }
                     node.stop();
                     return Ok(());
                 }
                 _ = shutdown_rx.recv() => {
                     error!("Received shutdown signal, shutting down");
+                    close_gossip_connections(&gossip_tx).await;
                     if let Some(api) = api_system {
-                        api.shutdown().await;
+                        shut_down_api(api).await;
                     }
                     node.stop();
                     return Ok(());
@@ -1022,6 +1129,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 snapchain::connectors::onchain_events::Subscriber::new(
                     &app_config.onchain_events,
                     node_local_state::Chain::Optimism,
+                    app_config.fc_network,
                     mempool_tx.clone(),
                     statsd_client.clone(),
                     local_state_store.clone(),
@@ -1043,6 +1151,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 snapchain::connectors::onchain_events::Subscriber::new(
                     &app_config.base_onchain_events,
                     node_local_state::Chain::Base,
+                    app_config.fc_network,
                     mempool_tx.clone(),
                     statsd_client.clone(),
                     local_state_store.clone(),
@@ -1105,6 +1214,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 tokio::spawn(async move { block_receiver.run().await });
             }
         }
+
+        let l1_validator = Arc::new(L1Validator::new(
+            chains_clients,
+            node.shard_stores.clone(),
+            Box::new(routing::ShardRouter {}),
+            app_config.consensus.num_shards,
+            app_config.fc_network,
+            app_config.l1_gate.cache_config(),
+        ));
+        let (gossip_l1_gate, gossip_l1_gate_worker) = GossipL1Gate::new(
+            app_config.l1_gate.clone(),
+            l1_validator.clone(),
+            app_config.fc_network,
+            mempool_tx.clone(),
+            statsd_client.clone(),
+        );
+        tokio::spawn(gossip_l1_gate_worker.run());
 
         if let Some(hyper_engine) = node.hyper_block_engine.clone() {
             let mut hyper_block_rx = block_tx.subscribe();
@@ -1197,7 +1323,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             node.shard_stores.clone(),
             node.shard_senders.clone(),
             node.block_stores.clone(),
-            chains_clients,
+            l1_validator,
             replicator,
             local_state_store.clone(),
             api_handler,
@@ -1234,21 +1360,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
             });
         }
 
+        // Wait for the readiness signal before entering the consensus loop.
+        // Today the signal fires synchronously at the end of
+        // SnapchainNode::create(), so this returns immediately. The gate is in
+        // place so a future change that introduces real concurrency in node
+        // init (e.g., parallel shard DB open via spawn_blocking) can hold
+        // consensus message dispatch until the actors are ready, without
+        // changing the call site here.
+        {
+            let mut wal_replay_complete = node.wal_replay_complete.clone();
+            if !*wal_replay_complete.borrow() {
+                info!("Waiting for WAL replay to complete before consensus participation");
+                let _ = wal_replay_complete.changed().await;
+            }
+            info!("Validator initialization complete; entering consensus loop");
+        }
+
         // Kick it off
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
         loop {
             select! {
-                _ = ctrl_c() => {
-                    info!("Received Ctrl-C, shutting down");
+                signal = &mut shutdown => {
+                    info!(signal, "Received shutdown signal, shutting down");
+                    close_gossip_connections(&gossip_tx).await;
                     if let Some(api) = api_system {
-                        api.shutdown().await;
+                        shut_down_api(api).await;
                     }
                     node.stop();
                     return Ok(());
                 }
                 _ = shutdown_rx.recv() => {
                     error!("Received shutdown signal, shutting down");
+                    close_gossip_connections(&gossip_tx).await;
                     if let Some(api) = api_system {
-                        api.shutdown().await;
+                        shut_down_api(api).await;
                     }
                     node.stop();
                     return Ok(());
@@ -1259,12 +1405,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             // Forward to appropriate consensus actors
                             node.dispatch(shard, event);
                         },
-                        SystemMessage::Mempool(msg) => {
-                            let res = mempool_tx.try_send(msg);
-                            if let Err(e) = res {
-                                warn!("Failed to add to local mempool: {:?}", e);
-                            }
-                        },
+                        SystemMessage::Mempool(msg) => gossip_l1_gate.admit(msg),
                         SystemMessage::BlockRequest {block_event_seqnum, block_tx } => {
                             let block= node.block_stores.get_block_by_event_seqnum(block_event_seqnum);
                             block_tx.send(block).unwrap();

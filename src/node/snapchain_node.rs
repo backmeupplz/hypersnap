@@ -21,9 +21,10 @@ use libp2p::identity::ed25519::Keypair;
 use libp2p::PeerId;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
-use tokio::sync::{broadcast, mpsc};
-use tracing::warn;
+use tokio::sync::{broadcast, mpsc, watch};
+use tracing::{info, warn};
 
 const MAX_SHARDS: u32 = 64;
 
@@ -33,8 +34,16 @@ pub struct SnapchainNode {
     pub shard_stores: HashMap<u32, Stores>,
     pub shard_senders: HashMap<u32, Senders>,
     pub block_stores: BlockStores,
-    pub hyper_block_engine: Option<Arc<Mutex<BlockEngine>>>,
     pub address: Address,
+    pub hyper_block_engine: Option<Arc<Mutex<BlockEngine>>>,
+    /// Set to `true` once node creation has finished spawning all consensus
+    /// actors (and, by extension, the WAL actors they depend on). Consumers
+    /// can `await` `changed()` on a clone to gate consensus-publishing work
+    /// until the node is fully initialized. Today this fires synchronously at
+    /// the end of `create()`; the channel exists so a future change that
+    /// parallelizes shard init via `spawn_blocking` retains a single
+    /// readiness signal.
+    pub wal_replay_complete: watch::Receiver<bool>,
 }
 
 impl SnapchainNode {
@@ -55,14 +64,29 @@ impl SnapchainNode {
         block_cache: Option<rocksdb::Cache>,
     ) -> Self {
         let validator_address = Address(keypair.public().to_bytes());
+        let (wal_replay_complete_tx, wal_replay_complete_rx) = watch::channel(false);
 
         // Now create the block validator
         let block_shard = SnapchainShard::new(0);
 
         // We might want to use different keys for the block shard so signatures are different and cannot be accidentally used in the wrong shard
         let trie = MerkleTrie::new().unwrap();
-        let block_db =
-            RocksDB::open_shard_db_with_cache(rocksdb_dir.as_str(), 0, block_cache.clone());
+        let block_db = {
+            let started = Instant::now();
+            let dir = rocksdb_dir.clone();
+            let cache = block_cache.clone();
+            let db = tokio::task::spawn_blocking(move || {
+                RocksDB::open_shard_db_with_cache(dir.as_str(), 0, cache)
+            })
+            .await
+            .expect("RocksDB block-shard open task panicked");
+            info!(
+                shard_id = 0,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Shard store initialized"
+            );
+            db
+        };
         let engine = BlockEngine::new(
             trie,
             statsd_client.clone(),
@@ -72,12 +96,28 @@ impl SnapchainNode {
             network,
         );
         let block_stores = engine.stores();
+        let hyper_db_dir: Option<String> = None;
+        let hyper_block_engine = if let Some(ref hyper_dir) = hyper_db_dir {
+            let hyper_trie = MerkleTrie::new().unwrap();
+            let hyper_block_db =
+                RocksDB::open_shard_db_with_cache(hyper_dir.as_str(), 0, block_cache.clone());
+            let hyper_engine = BlockEngine::new(
+                hyper_trie,
+                statsd_client.clone(),
+                hyper_block_db,
+                config.max_messages_per_block,
+                None,
+                network,
+            );
+            Some(Arc::new(Mutex::new(hyper_engine)))
+        } else {
+            None
+        };
 
         let mut consensus_actors = BTreeMap::new();
 
         let mut shard_senders: HashMap<u32, Senders> = HashMap::new();
         let mut shard_stores: HashMap<u32, Stores> = HashMap::new();
-        let hyper_db_dir: Option<String> = None;
 
         // Create the shard validators
         for shard_id in config.shard_ids.clone() {
@@ -90,11 +130,22 @@ impl SnapchainNode {
             let shard = SnapchainShard::new(shard_id);
             let ctx = SnapchainValidatorContext::new(keypair.clone());
 
-            let db = RocksDB::open_shard_db_with_cache(
-                rocksdb_dir.clone().as_str(),
-                shard_id,
-                block_cache.clone(),
-            );
+            let db = {
+                let started = Instant::now();
+                let dir = rocksdb_dir.clone();
+                let cache = block_cache.clone();
+                let db = tokio::task::spawn_blocking(move || {
+                    RocksDB::open_shard_db_with_cache(dir.as_str(), shard_id, cache)
+                })
+                .await
+                .expect("RocksDB shard open task panicked");
+                info!(
+                    shard_id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Shard store initialized"
+                );
+                db
+            };
             let trie = merkle_trie::MerkleTrie::new().unwrap(); //TODO: don't unwrap()
             let engine = match ShardEngine::new(
                 db.clone(),
@@ -174,38 +225,6 @@ impl SnapchainNode {
             consensus_actors.insert(shard_id, consensus_actor.unwrap());
         }
 
-        // Now create the block validator
-        let block_shard = SnapchainShard::new(0);
-
-        // We might want to use different keys for the block shard so signatures are different and cannot be accidentally used in the wrong shard
-        let trie = MerkleTrie::new().unwrap();
-        let block_db =
-            RocksDB::open_shard_db_with_cache(rocksdb_dir.as_str(), 0, block_cache.clone());
-        let engine = BlockEngine::new(
-            trie,
-            statsd_client.clone(),
-            block_db,
-            config.max_messages_per_block,
-            Some(messages_request_tx.clone()),
-            network,
-        );
-        let block_stores = engine.stores();
-        let hyper_block_engine = if let Some(ref hyper_dir) = hyper_db_dir {
-            let hyper_trie = MerkleTrie::new().unwrap();
-            let hyper_block_db =
-                RocksDB::open_shard_db_with_cache(hyper_dir.as_str(), 0, block_cache.clone());
-            let hyper_engine = BlockEngine::new(
-                hyper_trie,
-                statsd_client.clone(),
-                hyper_block_db,
-                config.max_messages_per_block,
-                None,
-                network,
-            );
-            Some(Arc::new(Mutex::new(hyper_engine)))
-        } else {
-            None
-        };
         let block_proposer = BlockProposer::new(
             validator_address.clone(),
             block_shard.clone(),
@@ -243,6 +262,8 @@ impl SnapchainNode {
         }
         consensus_actors.insert(0, block_consensus_actor.unwrap());
 
+        let _ = wal_replay_complete_tx.send(true);
+
         Self {
             consensus_actors,
             address: validator_address,
@@ -250,6 +271,7 @@ impl SnapchainNode {
             shard_stores,
             block_stores,
             hyper_block_engine,
+            wal_replay_complete: wal_replay_complete_rx,
         }
     }
 
