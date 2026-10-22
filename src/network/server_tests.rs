@@ -1430,6 +1430,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_has_link_and_has_reaction() {
+        use crate::api::HubQueryHandler;
+        use proto::reaction_body::Target;
+        use proto::ReactionType::{Like, Recast};
+
+        let (
+            _stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None).await;
+        let engine1 = &mut engine1;
+        let engine2 = &mut engine2;
+        for (fid, engine) in [(SHARD1_FID, &mut *engine1), (SHARD2_FID, &mut *engine2)] {
+            test_helper::register_user(
+                fid,
+                test_helper::default_signer(),
+                test_helper::default_custody_address(),
+                engine,
+            )
+            .await;
+        }
+        let cast = messages_factory::casts::create_cast_add(SHARD2_FID, "two", None, None);
+        let target = || {
+            Target::TargetCastId(proto::CastId {
+                fid: SHARD2_FID,
+                hash: cast.hash.clone(),
+            })
+        };
+        let follow =
+            messages_factory::links::create_link_add(SHARD1_FID, "follow", SHARD2_FID, None, None);
+        let like = messages_factory::reactions::create_reaction_add(
+            SHARD1_FID,
+            Like,
+            target(),
+            None,
+            None,
+        );
+        let recast = messages_factory::reactions::create_reaction_add(
+            SHARD1_FID,
+            Recast,
+            target(),
+            None,
+            None,
+        );
+        let unrecast = messages_factory::reactions::create_reaction_remove(
+            SHARD1_FID,
+            Recast,
+            target(),
+            Some(recast.data.as_ref().unwrap().timestamp + 10),
+            None,
+        );
+        test_helper::commit_message(engine2, &cast).await;
+        for msg in [&follow, &like, &recast, &unrecast] {
+            test_helper::commit_message(engine1, msg).await;
+        }
+
+        assert!(service.has_link(SHARD1_FID, "follow", SHARD2_FID).await);
+        assert!(!service.has_link(SHARD2_FID, "follow", SHARD1_FID).await);
+        assert!(!service.has_link(SHARD1_FID, "block", SHARD2_FID).await);
+        let reacted = |kind: proto::ReactionType| {
+            service.has_reaction(SHARD1_FID, kind as i32, SHARD2_FID, &cast.hash)
+        };
+        assert!(reacted(Like).await);
+        assert!(!reacted(Recast).await, "a removed recast is not live");
+    }
+
+    #[tokio::test]
     async fn test_conversation_keeps_replies_past_reply_limit() {
         let (
             _stores,

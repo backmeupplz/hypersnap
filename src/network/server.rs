@@ -3698,6 +3698,37 @@ impl crate::api::HubQueryHandler for MyHubService {
         Ok(page.messages)
     }
 
+    async fn has_link(&self, fid: u64, link_type: &str, target_fid: u64) -> bool {
+        let Ok(stores) = self.get_stores_for(fid) else {
+            return false;
+        };
+        LinkStore::get_link_add(
+            &stores.link_store,
+            fid,
+            link_type.to_string(),
+            Some(link_body::Target::TargetFid(target_fid)),
+        )
+        .is_ok_and(|link| link.is_some())
+    }
+
+    async fn has_reaction(
+        &self,
+        fid: u64,
+        reaction_type: i32,
+        cast_fid: u64,
+        cast_hash: &[u8],
+    ) -> bool {
+        let Ok(stores) = self.get_stores_for(fid) else {
+            return false;
+        };
+        let target = reaction_body::Target::TargetCastId(CastId {
+            fid: cast_fid,
+            hash: cast_hash.to_vec(),
+        });
+        ReactionStore::get_reaction_add(&stores.reaction_store, fid, reaction_type, Some(target))
+            .is_ok_and(|reaction| reaction.is_some())
+    }
+
     async fn get_user_data_by_fid(&self, fid: u64) -> Result<Vec<Message>, String> {
         let stores = self
             .get_stores_for(fid)
