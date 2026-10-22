@@ -109,7 +109,8 @@ impl UserDataIndexer {
                 if value.len() == 8 {
                     results.push(u64::from_be_bytes(value[..8].try_into().unwrap()));
                 }
-                Ok(results.len() < limit)
+                // `true` stops the iteration.
+                Ok(results.len() >= limit)
             },
         );
         results

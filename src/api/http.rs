@@ -138,11 +138,15 @@ pub trait HubQueryHandler: Send + Sync {
     async fn get_signer_events(&self, fid: u64) -> Result<Vec<crate::proto::OnChainEvent>, String>;
 
     /// Get notifications for a user (reactions + mentions on their casts + follows).
+    /// With `include_quotes_and_deep_replies`, also replies deeper in threads
+    /// under the user's casts and, when `quotes` is given, casts quoting them.
     async fn get_notifications(
         &self,
         fid: u64,
         limit: usize,
         cursor: Option<&str>,
+        include_quotes_and_deep_replies: bool,
+        quotes: Option<&crate::api::cast_quotes_index::CastQuotesIndexer>,
     ) -> Result<(Vec<crate::proto::Message>, Option<String>), String>;
 
     /// Get links by FID and link type (e.g. "follow", "block", "mute").
@@ -1298,8 +1302,16 @@ impl ApiHttpHandler {
             // === Notification endpoints ===
             "/v2/farcaster/notifications" => {
                 let fid: u64 = require_fid!(params);
-                self.handle_notifications(fid, cursor.as_deref(), limit)
-                    .await
+                let include_quotes_and_deep_replies = params
+                    .get("include_quotes_and_deep_replies")
+                    .is_some_and(|v| v == "true");
+                self.handle_notifications(
+                    fid,
+                    cursor.as_deref(),
+                    limit,
+                    include_quotes_and_deep_replies,
+                )
+                .await
             }
             "/v2/farcaster/notifications/channel" => {
                 let fid: u64 = require_fid!(params);
@@ -3066,12 +3078,13 @@ impl ApiHttpHandler {
         }
     }
 
-    /// Handle GET /v2/farcaster/notifications?fid=N
+    /// Handle GET /v2/farcaster/notifications?fid=N&include_quotes_and_deep_replies=true
     async fn handle_notifications(
         &self,
         fid: u64,
         cursor: Option<&str>,
         limit: usize,
+        include_quotes_and_deep_replies: bool,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let hub = self.hub_query.read().unwrap().clone();
         let Some(hub) = hub else {
@@ -3081,14 +3094,33 @@ impl ApiHttpHandler {
             ));
         };
 
-        match hub.get_notifications(fid, limit, cursor).await {
+        match hub
+            .get_notifications(
+                fid,
+                limit,
+                cursor,
+                include_quotes_and_deep_replies,
+                self.cast_quotes_index.as_deref(),
+            )
+            .await
+        {
             Ok((messages, next_cursor)) => {
                 let mut notifications = Vec::new();
                 for msg in &messages {
                     if let Some(data) = &msg.data {
                         let user = self.get_user(data.fid).await;
                         let notif_type = match crate::proto::MessageType::try_from(data.r#type) {
+                            Ok(crate::proto::MessageType::ReactionAdd)
+                                if include_quotes_and_deep_replies && is_recast(data) =>
+                            {
+                                "recasts"
+                            }
                             Ok(crate::proto::MessageType::ReactionAdd) => "likes",
+                            Ok(crate::proto::MessageType::CastAdd)
+                                if include_quotes_and_deep_replies && is_quote_of(data, fid) =>
+                            {
+                                "quote"
+                            }
                             Ok(crate::proto::MessageType::CastAdd) => "reply",
                             Ok(crate::proto::MessageType::LinkAdd) => "follows",
                             _ => "mention",
@@ -3190,7 +3222,10 @@ impl ApiHttpHandler {
         }
 
         // Fetch more notifications than needed so we can filter
-        match hub.get_notifications(fid, limit * 10, cursor).await {
+        match hub
+            .get_notifications(fid, limit * 10, cursor, false, None)
+            .await
+        {
             Ok((messages, next_cursor)) => {
                 let mut notifications = Vec::new();
                 for msg in &messages {
@@ -3301,7 +3336,10 @@ impl ApiHttpHandler {
 
         let target_urls: Vec<&str> = parent_urls_param.split(',').map(|s| s.trim()).collect();
 
-        match hub.get_notifications(fid, limit * 10, cursor).await {
+        match hub
+            .get_notifications(fid, limit * 10, cursor, false, None)
+            .await
+        {
             Ok((messages, next_cursor)) => {
                 let mut notifications = Vec::new();
                 for msg in &messages {
@@ -4789,6 +4827,33 @@ fn format_timestamp(ts: u32) -> String {
         .unwrap_or_else(|| ts.to_string())
 }
 
+/// Whether a reaction message is a recast.
+fn is_recast(data: &crate::proto::MessageData) -> bool {
+    matches!(
+        &data.body,
+        Some(crate::proto::message_data::Body::ReactionBody(body))
+            if body.r#type == crate::proto::ReactionType::Recast as i32
+    )
+}
+
+/// Whether a cast quotes a cast by `fid` without being a direct reply to one.
+fn is_quote_of(data: &crate::proto::MessageData, fid: u64) -> bool {
+    let Some(crate::proto::message_data::Body::CastAddBody(body)) = &data.body else {
+        return false;
+    };
+    let replies_to_fid = matches!(
+        &body.parent,
+        Some(crate::proto::cast_add_body::Parent::ParentCastId(parent)) if parent.fid == fid
+    );
+    !replies_to_fid
+        && body.embeds.iter().any(|embed| {
+            matches!(
+                &embed.embed,
+                Some(crate::proto::embed::Embed::CastId(quoted)) if quoted.fid == fid
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5244,6 +5309,8 @@ mod tests {
             _fid: u64,
             _limit: usize,
             _cursor: Option<&str>,
+            _include_quotes_and_deep_replies: bool,
+            _quotes: Option<&crate::api::cast_quotes_index::CastQuotesIndexer>,
         ) -> Result<(Vec<crate::proto::Message>, Option<String>), String> {
             Ok((self.notifications.clone(), None))
         }
@@ -5658,7 +5725,9 @@ mod tests {
         let handler = ApiHttpHandler::new(None, None, None, None, None, None);
         handler.set_hub_query(mock);
 
-        let response = handler.handle_notifications(target_fid, None, 10).await;
+        let response = handler
+            .handle_notifications(target_fid, None, 10, false)
+            .await;
         let response = response.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -5719,5 +5788,66 @@ mod tests {
             follower_fid,
             "follow user should be follower"
         );
+    }
+
+    #[tokio::test]
+    async fn test_notifications_quote_and_recast_types_with_flag() {
+        let target_fid: u64 = 121;
+        let target_cast_id = crate::proto::CastId {
+            fid: target_fid,
+            hash: vec![5, 6, 7],
+        };
+
+        let mut quote = mock_cast(122, vec![1]);
+        if let Some(crate::proto::message_data::Body::CastAddBody(body)) =
+            &mut quote.data.as_mut().unwrap().body
+        {
+            body.embeds.push(crate::proto::Embed {
+                embed: Some(crate::proto::embed::Embed::CastId(target_cast_id.clone())),
+            });
+        }
+        let recast = crate::proto::Message {
+            data: Some(crate::proto::MessageData {
+                fid: 123,
+                r#type: crate::proto::MessageType::ReactionAdd as i32,
+                body: Some(crate::proto::message_data::Body::ReactionBody(
+                    crate::proto::ReactionBody {
+                        r#type: crate::proto::ReactionType::Recast as i32,
+                        target: Some(crate::proto::reaction_body::Target::TargetCastId(
+                            target_cast_id.clone(),
+                        )),
+                    },
+                )),
+                ..Default::default()
+            }),
+            hash: vec![2],
+            ..Default::default()
+        };
+
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_hub_query(Arc::new(MockHubQuery {
+            notifications: vec![quote, recast],
+            cast_lookup: Some(mock_cast(target_fid, target_cast_id.hash)),
+            direct_reply_count: 0,
+            probes: Default::default(),
+        }));
+
+        for (flag, expected) in [(false, ["reply", "likes"]), (true, ["quote", "recasts"])] {
+            let response = handler
+                .handle_notifications(target_fid, None, 10, flag)
+                .await
+                .unwrap();
+            let json = collect_json(response).await;
+            let notifications = json["notifications"].as_array().unwrap();
+            let types: Vec<&str> = notifications
+                .iter()
+                .map(|n| n["type"].as_str().unwrap())
+                .collect();
+            assert_eq!(types, expected);
+            assert_eq!(notifications[0]["user"]["fid"], 122);
+            assert_eq!(notifications[0]["cast"]["hash"], "01");
+            assert_eq!(notifications[1]["user"]["fid"], 123);
+            assert_eq!(notifications[1]["cast"]["author"]["fid"], target_fid);
+        }
     }
 }
