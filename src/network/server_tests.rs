@@ -1572,71 +1572,57 @@ mod tests {
         test_helper::commit_message(engine2, &reply_3_another_shard).await;
         test_helper::commit_message(engine2, &reply_4_another_shard).await;
 
-        let response = service
-            .get_casts_by_parent(Request::new(proto::CastsByParentRequest {
-                parent: Some(proto::casts_by_parent_request::Parent::ParentCastId(
-                    proto::CastId {
-                        fid: SHARD1_FID,
-                        hash: original_cast.hash.clone(),
-                    },
-                )),
-                page_size: Some(1),
-                page_token: None,
-                reverse: None,
-            }))
-            .await
-            .unwrap();
-        test_helper::assert_contains_all_messages(&response, &[&reply_1, &reply_3_another_shard]);
-
-        let page_token = response.get_ref().next_page_token.clone();
-        let response = service
-            .get_casts_by_parent(Request::new(proto::CastsByParentRequest {
-                parent: Some(proto::casts_by_parent_request::Parent::ParentCastId(
-                    proto::CastId {
-                        fid: SHARD1_FID,
-                        hash: original_cast.hash.clone(),
-                    },
-                )),
-                page_size: Some(2),
-                page_token: page_token,
-                reverse: None,
-            }))
-            .await
-            .unwrap();
-        test_helper::assert_contains_all_messages(&response, &[&reply_2, &reply_4_another_shard]);
-
-        // Test reverse pagination
-        let response = service
-            .get_casts_by_parent(Request::new(proto::CastsByParentRequest {
-                parent: Some(proto::casts_by_parent_request::Parent::ParentCastId(
-                    proto::CastId {
-                        fid: SHARD1_FID,
-                        hash: original_cast.hash.clone(),
-                    },
-                )),
-                page_size: Some(1),
-                page_token: None,
-                reverse: Some(true),
-            }))
-            .await
-            .unwrap();
-
-        let page_token = response.get_ref().next_page_token.clone();
-        let response = service
-            .get_casts_by_parent(Request::new(proto::CastsByParentRequest {
-                parent: Some(proto::casts_by_parent_request::Parent::ParentCastId(
-                    proto::CastId {
-                        fid: SHARD1_FID,
-                        hash: original_cast.hash.clone(),
-                    },
-                )),
-                page_size: Some(2),
-                page_token: page_token.clone(),
-                reverse: Some(true),
-            }))
-            .await
-            .unwrap();
-        test_helper::assert_contains_all_messages(&response, &[&reply_1, &reply_3_another_shard]);
+        // Pages hold exactly `page_size` casts from both shards, in time order,
+        // and resume where they stopped until every cast was returned once.
+        let parent = proto::casts_by_parent_request::Parent::ParentCastId(proto::CastId {
+            fid: SHARD1_FID,
+            hash: original_cast.hash.clone(),
+        });
+        let in_order = [
+            &reply_1,
+            &reply_2,
+            &reply_3_another_shard,
+            &reply_4_another_shard,
+        ];
+        for reverse in [false, true] {
+            let mut expected: Vec<Vec<u8>> = in_order.iter().map(|m| m.hash.clone()).collect();
+            if reverse {
+                expected.reverse();
+            }
+            let mut pages = vec![];
+            let mut page_token = None;
+            for page_size in [1, 2, 2] {
+                let response = service
+                    .get_casts_by_parent(Request::new(proto::CastsByParentRequest {
+                        parent: Some(parent.clone()),
+                        page_size: Some(page_size),
+                        page_token,
+                        reverse: Some(reverse),
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                pages.push(
+                    response
+                        .messages
+                        .iter()
+                        .map(|m| m.hash.clone())
+                        .collect::<Vec<_>>(),
+                );
+                page_token = response.next_page_token;
+            }
+            assert_eq!(
+                pages,
+                vec![
+                    expected[..1].to_vec(),
+                    expected[1..3].to_vec(),
+                    expected[3..].to_vec()
+                ],
+                "reverse={}",
+                reverse
+            );
+            assert!(page_token.is_none(), "reverse={}", reverse);
+        }
     }
 
     #[tokio::test]
