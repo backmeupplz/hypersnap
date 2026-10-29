@@ -7,4 +7,8 @@ pub mod validator;
 #[cfg(test)]
 mod proposed_values_test;
 #[cfg(test)]
+mod proposer_test;
+#[cfg(test)]
 mod read_validator_test;
+#[cfg(test)]
+mod validator_test;

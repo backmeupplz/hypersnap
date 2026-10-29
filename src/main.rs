@@ -36,6 +36,7 @@ use std::error::Error;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, net};
@@ -451,6 +452,10 @@ fn is_dir_empty(path: &str) -> std::io::Result<bool> {
     Ok(entries.next().is_none())
 }
 
+/// Set once shutdown has started, so critical tasks that stop as part of it (gossip returns
+/// after closing its connections) are not reported as failures.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
 /// Spawns a task the node cannot run without. If it ever returns or panics, the node exits
 /// with an error so its supervisor restarts it, rather than running on without it.
 fn spawn_critical<F>(name: &'static str, task: F, system_tx: mpsc::Sender<SystemMessage>)
@@ -459,7 +464,12 @@ where
 {
     let handle = tokio::spawn(task);
     tokio::spawn(async move {
-        let reason = match handle.await {
+        let result = handle.await;
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            info!("{} task stopped for shutdown", name);
+            return;
+        }
+        let reason = match result {
             Ok(()) => format!("{} task exited", name),
             Err(err) => format!("{} task failed: {}", name, err),
         };
@@ -512,6 +522,10 @@ const API_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Initialize rustls before any HTTPS or gRPC.
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+        .expect("Failed to install rustls crypto provider");
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -555,6 +569,7 @@ async fn shutdown_signal() -> &'static str {
 async fn close_gossip_connections(
     gossip_tx: &mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
 ) {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     if gossip_tx.send(GossipEvent::Shutdown(done_tx)).await.is_ok() {
         // The gossip task bounds its own wait; this only guards a stalled task.
@@ -703,15 +718,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if db_is_empty {
         match app_config.snapshot.bootstrap_method {
             BootstrapMethod::Replicate => {
-                use rustls::crypto::{self, ring};
                 use snapchain::bootstrap::replication::service::{
                     ReplicatorBootstrap, WorkUnitResponse,
                 };
                 use tokio::time::{sleep, Duration};
-
-                // Initialize SSL for rustls
-                crypto::CryptoProvider::install_default(ring::default_provider())
-                    .expect("Failed to install rustls crypto provider");
 
                 info!("Starting node with replication bootstrap");
                 let replicator = ReplicatorBootstrap::new(statsd_client.clone(), &app_config);
@@ -826,14 +836,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // shared Prometheus registry below.
     let gossip_metrics = gossip.metrics();
 
-    // Spawn gossip early — before node creation — so the QUIC keep-alive and
-    // gossipsub control loop runs during the potentially heavy RocksDB shard
-    // initialization, preventing peer timeouts.
-    tokio::spawn(async move {
-        info!("Starting gossip");
-        gossip.start().await;
-        info!("Gossip Stopped");
-    });
+    // Spawn the libp2p Swarm event loop now, ahead of SnapchainNode::create().
+    // Driving it in parallel with shard DB init lets QUIC keep-alives and
+    // gossipsub control messages flow during the heavy boot window, instead
+    // of being deferred until after all RocksDB stores are open.
+    spawn_critical(
+        "Gossip",
+        async move {
+            info!("Starting gossip");
+            gossip.start().await;
+        },
+        system_tx.clone(),
+    );
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
