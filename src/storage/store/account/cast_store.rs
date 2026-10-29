@@ -496,7 +496,7 @@ impl CastStore {
             ..Default::default()
         };
 
-        store.get_remove(&partial_message)
+        store.get_remove(&partial_message, None)
     }
 
     pub fn get_cast_adds_by_fid(

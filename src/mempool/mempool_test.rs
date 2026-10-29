@@ -14,7 +14,7 @@ mod tests {
             StorageUnitType, Transaction,
         },
         storage::store::{
-            account::make_ts_hash,
+            account::{make_ts_hash, ChannelModerateStore, DerivedIndexGate},
             block_engine::BlockEngine,
             block_engine_test_helpers,
             engine::ShardEngine,
@@ -60,6 +60,31 @@ mod tests {
         broadcast::Sender<Block>,
         mpsc::Receiver<SystemMessage>,
     ) {
+        setup_for_network(
+            config,
+            enable_rate_limits,
+            num_shards,
+            FarcasterNetwork::Devnet,
+        )
+        .await
+    }
+
+    async fn setup_for_network(
+        config: Option<Config>,
+        enable_rate_limits: bool,
+        num_shards: u32,
+        network: FarcasterNetwork,
+    ) -> (
+        HashMap<u32, ShardEngine>,
+        BlockEngine,
+        Option<SnapchainGossip>,
+        Mempool,
+        mpsc::Sender<MempoolRequest>,
+        mpsc::Sender<MempoolMessagesRequest>,
+        broadcast::Sender<ShardChunk>,
+        broadcast::Sender<Block>,
+        mpsc::Receiver<SystemMessage>,
+    ) {
         let keypair = Keypair::generate();
         let statsd_client = StatsdClientWrapper::new(
             cadence::StatsdClient::builder("", cadence::NopMetricSink {}).build(),
@@ -90,7 +115,7 @@ mod tests {
                     &config,
                     Some(system_tx),
                     false,
-                    proto::FarcasterNetwork::Devnet,
+                    network,
                     statsd_client.clone(),
                     Vec::new(),
                 )
@@ -108,7 +133,7 @@ mod tests {
         mempool_config.enable_rate_limits = enable_rate_limits;
         let mempool = Mempool::new(
             mempool_config,
-            FarcasterNetwork::Devnet,
+            network,
             mempool_rx,
             messages_request_rx,
             num_shards,
@@ -131,6 +156,68 @@ mod tests {
             block_decision_tx,
             system_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn s4_mempool_wall_clock_rejects_channels_before_v24_and_admits_them_at_v24() {
+        let (_, _, _, mut pre_v24_mempool, _, _, _, _, _) =
+            setup_for_network(None, false, 1, FarcasterNetwork::Mainnet).await;
+        let (_, _, _, mut v24_mempool, _, _, _, _, _) =
+            setup_for_network(None, false, 1, FarcasterNetwork::Devnet).await;
+
+        for (message_type, body) in messages_factory::channels::all_message_bodies() {
+            // Timestamp zero is deliberately from the pre-cutover regime. Channel embedded
+            // timestamps are inert, so wall-clock admission changes only with the node version.
+            let message =
+                messages_factory::create_message_with_data(1234, message_type, body, Some(0), None);
+            let error = pre_v24_mempool
+                .message_is_valid(0, &MempoolMessage::UserMessage(message.clone()), true)
+                .unwrap_err();
+            assert_eq!(error.message, "channel messages not yet active");
+            assert!(v24_mempool
+                .message_is_valid(0, &MempoolMessage::UserMessage(message), true)
+                .is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_channel_moderate_dedup_uses_the_full_message_key() {
+        let (_, block_engine, _, mut mempool, _, _, _, _, _) = setup(None, false, 1).await;
+        let fid = 1234;
+        let timestamp = messages_factory::farcaster_time();
+        let channel_id = vec![0x11; 32];
+        let moderate = |cast_byte| {
+            messages_factory::create_message_with_data(
+                fid,
+                proto::MessageType::ChannelModerate,
+                proto::message_data::Body::ChannelModerateBody(proto::ChannelModerateBody {
+                    channel_id: channel_id.clone(),
+                    cast_hash: vec![cast_byte; 20],
+                    action: proto::ChannelModerateAction::Hide as i32,
+                }),
+                Some(timestamp),
+                None,
+            )
+        };
+        let merged = moderate(0x22);
+        let distinct_slot = moderate(0x33);
+        let stores = block_engine.stores();
+        let mut txn = crate::storage::db::RocksDbTransactionBatch::new();
+        ChannelModerateStore::merge(
+            &stores.channel_moderate_store,
+            &merged,
+            &mut txn,
+            DerivedIndexGate::Write,
+        )
+        .unwrap();
+        stores.db.commit(txn).unwrap();
+
+        assert!(mempool
+            .message_is_valid(0, &MempoolMessage::UserMessage(merged.clone()), true,)
+            .is_err());
+        assert!(mempool
+            .message_is_valid(0, &MempoolMessage::UserMessage(distinct_slot), true)
+            .is_ok());
     }
 
     async fn pull_message(
@@ -546,6 +633,7 @@ mod tests {
             timestamp: 0,
             parent_hash: vec![],
             shard_root: vec![],
+            transactions_root: vec![],
         };
 
         // Create fake chunk with cast1
@@ -1276,6 +1364,7 @@ mod tests {
                 timestamp: 0,
                 parent_hash: vec![],
                 shard_root: vec![],
+                transactions_root: vec![],
             }),
             hash: vec![],
             transactions: vec![Transaction {
@@ -1337,6 +1426,7 @@ mod tests {
                 timestamp: 0,
                 parent_hash: vec![],
                 shard_root: vec![],
+                transactions_root: vec![],
             }),
             hash: vec![],
             transactions: vec![Transaction {
@@ -1351,5 +1441,128 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         pull_message(&messages_request_tx, 1, None).await;
+    }
+
+    /// Pull-time `message_is_valid` (`at_admission = false`) must not invoke the
+    /// rate limiter — the token was already consumed at admission, and re-running
+    /// the check would double-charge the bucket and silently drop accepted messages
+    /// before they ever reach the engine. Same fixture as `test_rate_limits_applied`
+    /// (FID registered with no storage rent → admission rejects on rate-limit), but
+    /// flipping the flag to `false` must turn the rate-limit branch into a no-op
+    /// and leave the message admissible by all other criteria.
+    #[tokio::test]
+    async fn test_rate_limits_skipped_at_pull_time() {
+        let (mut engines, _, _, mut mempool, _, _, _, _, _) = setup(None, true, 1).await;
+        let mut engine = engines.get_mut(&1).unwrap();
+
+        let id_register_event = events_factory::create_id_register_event(
+            FID_FOR_TEST,
+            proto::IdRegisterEventType::Register,
+            default_custody_address(),
+            None,
+        );
+        commit_event(&mut engine, &id_register_event).await;
+        let signer_event = events_factory::create_signer_event(
+            FID_FOR_TEST,
+            default_signer(),
+            proto::SignerEventType::Add,
+            None,
+            None,
+        );
+        commit_event(&mut engine, &signer_event).await;
+
+        // Sanity: at admission, an FID with no storage rent fails the rate limit.
+        let cast = create_cast_add(FID_FOR_TEST, "hello", None, None);
+        let admission_result =
+            mempool.message_is_valid(1, &MempoolMessage::UserMessage(cast.clone()), true);
+        assert!(
+            admission_result.is_err(),
+            "without storage rent the admission-time rate limit must reject"
+        );
+
+        // At pull time the same fixture must be admissible — the rate limiter is
+        // gated off and only the cheap idempotent checks (feature gate, BlockEvent
+        // shard, post-merge dedup) run.
+        let pull_result = mempool.message_is_valid(1, &MempoolMessage::UserMessage(cast), false);
+        assert!(
+            pull_result.is_ok(),
+            "at_admission=false must skip the rate limiter so already-admitted \
+             messages survive being re-validated on the way out of the buffer"
+        );
+    }
+
+    async fn add_gossiped_message(
+        mempool_tx: &mpsc::Sender<MempoolRequest>,
+        message: proto::Message,
+    ) -> Result<(), crate::core::error::HubError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        mempool_tx
+            .send(MempoolRequest::AddMessage(
+                MempoolMessage::UserMessage(message),
+                MempoolSource::Gossip,
+                Some(reply_tx),
+            ))
+            .await
+            .unwrap();
+        reply_rx
+            .await
+            .expect("mempool dropped the reply; the mempool task has likely panicked")
+    }
+
+    #[tokio::test]
+    async fn test_malformed_gossiped_messages_are_rejected_without_stopping_the_mempool() {
+        let (
+            _,
+            _,
+            _,
+            mut mempool,
+            mempool_tx,
+            messages_request_tx,
+            _shard_decision_tx,
+            _block_decision_tx,
+            _,
+        ) = setup(None, false, 1).await;
+        tokio::spawn(async move {
+            mempool.run().await;
+        });
+
+        let mut no_data = create_cast_add(1234, "no data", None, None);
+        no_data.data = None;
+        no_data.data_bytes = None;
+
+        let mut short_hash = create_cast_add(1234, "short hash", None, None);
+        short_hash.hash.truncate(19);
+
+        let mut bad_signature = create_cast_add(1234, "bad signature", None, None);
+        bad_signature.signature[0] ^= 0xff;
+
+        for message in [no_data, short_hash, bad_signature] {
+            let error = add_gossiped_message(&mempool_tx, message)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "bad_request.validation_failure");
+        }
+        pull_message(&messages_request_tx, 1, None).await;
+
+        let valid = create_cast_add(1234, "valid", None, None);
+        add_gossiped_message(&mempool_tx, valid.clone())
+            .await
+            .unwrap();
+        pull_message(
+            &messages_request_tx,
+            1,
+            Some(MempoolMessage::UserMessage(valid)),
+        )
+        .await;
+    }
+
+    #[test]
+    fn test_mempool_key_does_not_panic_without_data() {
+        use crate::mempool::mempool::MessageMempoolExt;
+
+        let mut message = create_cast_add(1234, "no data", None, None);
+        message.data = None;
+        let key = message.mempool_key();
+        assert_eq!(key.identity(), message.hex_hash());
     }
 }

@@ -1,11 +1,14 @@
-use crate::core::types::{CommitsExt, Proposal, Signature, SnapchainValidatorContext, Vote};
+use crate::core::types::{
+    round_from_i64, CommitsExt, Proposal, Signature, SnapchainValidatorContext, Vote,
+    WellFormedProposal,
+};
 use crate::proto::sync_request::SyncRequest;
 use crate::proto::{self};
 use crate::proto::{consensus_message, ConsensusMessage, FullProposal, StatusMessage};
 use bytes::Bytes;
 use informalsystems_malachitebft_codec::Codec;
 use informalsystems_malachitebft_core_consensus::SignedConsensusMsg;
-use informalsystems_malachitebft_core_types::{Round, SignedProposal, SignedVote, VoteSet};
+use informalsystems_malachitebft_core_types::{SignedProposal, SignedVote, VoteSet};
 use informalsystems_malachitebft_engine::util::streaming::{
     StreamContent, StreamId, StreamMessage,
 };
@@ -28,6 +31,12 @@ pub enum SnapchainCodecError {
     InvalidField(String),
 }
 
+impl From<String> for SnapchainCodecError {
+    fn from(err: String) -> Self {
+        SnapchainCodecError::InvalidField(err)
+    }
+}
+
 impl Codec<SignedConsensusMsg<SnapchainValidatorContext>> for SnapchainCodec {
     type Error = SnapchainCodecError;
 
@@ -38,18 +47,14 @@ impl Codec<SignedConsensusMsg<SnapchainValidatorContext>> for SnapchainCodec {
         let message = ConsensusMessage::decode(bytes)?;
         match message.consensus_message {
             Some(consensus_message::ConsensusMessage::Vote(vote)) => {
-                let vote_msg = Vote::try_from_proto(vote)
-                    .map_err(|e| SnapchainCodecError::InvalidField(e.into()))?;
                 Ok(SignedConsensusMsg::Vote(SignedVote {
-                    message: vote_msg,
+                    message: Vote::try_from_proto(vote)?,
                     signature: Signature(message.signature),
                 }))
             }
             Some(consensus_message::ConsensusMessage::Proposal(proposal)) => {
-                let prop_msg = Proposal::try_from_proto(proposal)
-                    .map_err(|e| SnapchainCodecError::InvalidField(e.into()))?;
                 Ok(SignedConsensusMsg::Proposal(SignedProposal {
-                    message: prop_msg,
+                    message: Proposal::try_from_proto(proposal)?,
                     signature: Signature(message.signature),
                 }))
             }
@@ -88,11 +93,16 @@ impl Codec<SignedConsensusMsg<SnapchainValidatorContext>> for SnapchainCodec {
     }
 }
 
+fn decode_well_formed_proposal(bytes: Bytes) -> Result<WellFormedProposal, SnapchainCodecError> {
+    let proposal = FullProposal::decode(bytes)?;
+    Ok(WellFormedProposal::try_from(proposal)?)
+}
+
 impl Codec<FullProposal> for SnapchainCodec {
     type Error = SnapchainCodecError;
 
     fn decode(&self, bytes: Bytes) -> Result<FullProposal, Self::Error> {
-        FullProposal::decode(bytes).map_err(SnapchainCodecError::Decode)
+        Ok(decode_well_formed_proposal(bytes)?.into_proposal())
     }
 
     fn encode(&self, msg: &FullProposal) -> Result<Bytes, Self::Error> {
@@ -105,19 +115,16 @@ impl Codec<StreamMessage<FullProposal>> for SnapchainCodec {
     type Error = SnapchainCodecError;
 
     fn decode(&self, bytes: Bytes) -> Result<StreamMessage<FullProposal>, Self::Error> {
-        let proposal: FullProposal = Self.decode(bytes)?;
-        let height = proposal.height.ok_or_else(|| {
-            SnapchainCodecError::InvalidField("FullProposal::height missing".into())
-        })?;
+        let proposal = decode_well_formed_proposal(bytes)?;
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&height.as_u64().to_be_bytes());
-        bytes.extend_from_slice(&proposal.round.to_be_bytes());
+        bytes.extend_from_slice(&proposal.height().as_u64().to_be_bytes());
+        bytes.extend_from_slice(&proposal.round().as_i64().to_be_bytes());
         let stream_id = StreamId::new(bytes.into());
 
         Ok(StreamMessage::new(
             stream_id,
             0,
-            StreamContent::Data(proposal),
+            StreamContent::Data(proposal.into_proposal()),
         ))
     }
 
@@ -188,7 +195,7 @@ impl Codec<sync::Request<SnapchainValidatorContext>> for SnapchainCodec {
                             "Missing height in VoteSetRequest".to_string(),
                         )
                     })?,
-                    round: Round::from(vote_set.round),
+                    round: round_from_i64(vote_set.round)?,
                 }))
             }
         }
@@ -236,9 +243,7 @@ impl Codec<sync::Response<SnapchainValidatorContext>> for SnapchainCodec {
                         "Missing commits in ValueResponse".to_string(),
                     )
                 })?;
-                let commit_certificate = commits
-                    .try_to_commit_certificate()
-                    .map_err(|e| SnapchainCodecError::InvalidField(e.into()))?;
+                let commit_certificate = commits.try_to_commit_certificate()?;
                 Ok(sync::Response::ValueResponse(sync::ValueResponse {
                     height: value.height.ok_or_else(|| {
                         SnapchainCodecError::InvalidField(
@@ -257,21 +262,19 @@ impl Codec<sync::Response<SnapchainValidatorContext>> for SnapchainCodec {
                     .into_iter()
                     .zip(vote_set.signatures)
                     .map(|(vote, signature)| {
-                        Vote::try_from_proto(vote)
-                            .map(|m| SignedVote {
-                                message: m,
-                                signature: Signature(signature),
-                            })
-                            .map_err(|e| SnapchainCodecError::InvalidField(e.into()))
+                        Ok(SignedVote {
+                            message: Vote::try_from_proto(vote)?,
+                            signature: Signature(signature),
+                        })
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, String>>()?;
                 Ok(sync::Response::VoteSetResponse(sync::VoteSetResponse {
                     height: vote_set.height.ok_or_else(|| {
                         SnapchainCodecError::InvalidField(
                             "Missing height in VoteSetResponse".to_string(),
                         )
                     })?,
-                    round: Round::from(vote_set.round),
+                    round: round_from_i64(vote_set.round)?,
                     vote_set: VoteSet::new(signed_votes),
                 }))
             }

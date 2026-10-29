@@ -53,8 +53,9 @@ pub mod events_factory {
     use super::*;
     use crate::{
         proto::{
-            self, BlockEvent, BlockEventData, BlockEventType, HeartbeatEventBody,
-            MergeMessageEventBody, StorageUnitType, TierPurchaseBody, TierType,
+            self, BlockEvent, BlockEventData, BlockEventType, ChannelRegisterBody,
+            ChannelRegisterEventType, HeartbeatEventBody, MergeMessageEventBody,
+            MergeOnChainEventEventBody, StorageUnitType, TierPurchaseBody, TierType,
         },
         storage::store::account::{StorageSlot, UNIT_TYPE_LEGACY_CUTOFF_TIMESTAMP},
     };
@@ -97,6 +98,36 @@ pub mod events_factory {
             body: Some(message::block_event_data::Body::MergeMessageEventBody(
                 MergeMessageEventBody {
                     message: Some(message),
+                },
+            )),
+        };
+        let hash = blake3::hash(data.encode_to_vec().as_slice())
+            .as_bytes()
+            .to_vec();
+        BlockEvent {
+            hash,
+            data: Some(data),
+        }
+    }
+
+    // Mints a MergeOnChainEvent BlockEvent carrying the whole original OnChainEvent. In
+    // production, shard 0 emits this type when the ChannelOwnershipEvents feature (>= V24) is
+    // active; tests construct it directly to exercise the receiver-side admission arm. The
+    // block_timestamp is left at 0 so the caller controls the feature gate via the engine's
+    // network (devnet -> V24 active; mainnet -> pre-V24 inactive), mirroring the KEY_ADD tests.
+    pub fn create_merge_on_chain_event_event(
+        on_chain_event: OnChainEvent,
+        seqnum: u64,
+    ) -> BlockEvent {
+        let data = BlockEventData {
+            seqnum,
+            r#type: BlockEventType::MergeOnChainEvent as i32,
+            block_number: 0,
+            event_index: 0,
+            block_timestamp: 0,
+            body: Some(message::block_event_data::Body::MergeOnChainEventEventBody(
+                MergeOnChainEventEventBody {
+                    on_chain_event: Some(on_chain_event),
                 },
             )),
         };
@@ -290,6 +321,38 @@ pub mod events_factory {
             )),
         }
     }
+
+    pub fn create_channel_register_event(
+        channel_key: &str,
+        label: Vec<u8>,
+        owner_address: Vec<u8>,
+        expiry: u64,
+        event_type: ChannelRegisterEventType,
+        block_number: u32,
+        log_index: u32,
+    ) -> OnChainEvent {
+        OnChainEvent {
+            r#type: OnChainEventType::EventTypeChannelRegister as i32,
+            chain_id: 8453,
+            block_number,
+            block_hash: vec![],
+            block_timestamp: block_number as u64,
+            transaction_hash: rand::random::<[u8; 32]>().to_vec(),
+            log_index,
+            fid: 0,
+            tx_index: 0,
+            version: 1,
+            body: Some(proto::on_chain_event::Body::ChannelRegisterEventBody(
+                ChannelRegisterBody {
+                    channel_key: channel_key.to_string(),
+                    expiry,
+                    owner_address,
+                    event_type: event_type as i32,
+                    label,
+                },
+            )),
+        }
+    }
 }
 
 pub mod messages_factory {
@@ -369,6 +432,8 @@ pub mod messages_factory {
                 mentions_positions: vec![],
                 parent,
                 r#type: cast_type.unwrap_or(CastType::Cast) as i32,
+                format_version: 0,
+                chain: None,
             };
             create_message_with_data(
                 fid,
@@ -395,6 +460,39 @@ pub mod messages_factory {
                 timestamp,
                 private_key,
             )
+        }
+
+        /// A cast signed over `data_bytes`, with `extra` appended to its encoded body, for bytes the
+        /// schema cannot express, such as a malformed `chain` (field 10).
+        pub fn create_cast_add_with_body_suffix(
+            fid: u64,
+            format_version: u32,
+            chain: Option<proto::ChainCast>,
+            extra: &[u8],
+            timestamp: Option<u32>,
+            private_key: &SigningKey,
+        ) -> message::Message {
+            let mut msg = create_cast_add(fid, "chain part", timestamp, Some(private_key));
+            let mut data = msg.data.take().unwrap();
+            let Some(message::message_data::Body::CastAddBody(mut body)) = data.body.take() else {
+                unreachable!()
+            };
+            body.format_version = format_version;
+            body.chain = chain;
+            let mut body_bytes = body.encode_to_vec();
+            body_bytes.extend_from_slice(extra);
+            let mut data_bytes = data.encode_to_vec();
+            prost::encoding::encode_key(
+                5,
+                prost::encoding::WireType::LengthDelimited,
+                &mut data_bytes,
+            );
+            prost::encoding::encode_varint(body_bytes.len() as u64, &mut data_bytes);
+            data_bytes.extend_from_slice(&body_bytes);
+            msg.hash = calculate_message_hash(&data_bytes);
+            msg.signature = private_key.sign(&msg.hash).to_bytes().to_vec();
+            msg.data_bytes = Some(data_bytes);
+            msg
         }
 
         pub fn create_cast_with_parent(
@@ -805,6 +903,56 @@ pub mod messages_factory {
         }
     }
 
+    pub mod channels {
+        //! Bodies for the channel message types. Shared by the ShardEngine and BlockEngine
+        //! channel tests so both pin the same shapes: two copies of this fixture could drift
+        //! apart while still looking identical, leaving one engine asserting a property for a
+        //! body that no longer matches the wire format. BlockEngine now admits and merges these
+        //! under `ProtocolFeature::ChannelMessages`; ShardEngine rejects their direct admission
+        //! and merges them only via shard-0 replay and replication.
+        use super::*;
+        use message::{ChannelMemberBody, ChannelModerateBody, ChannelPinBody, ChannelUpdateBody};
+
+        /// One representative body per channel message type, paired with its `MessageType`.
+        pub fn all_message_bodies() -> Vec<(MessageType, message::message_data::Body)> {
+            let channel_id = vec![0x11; 32];
+            let cast_hash = vec![0x22; 20];
+            vec![
+                (
+                    MessageType::ChannelUpdate,
+                    message::message_data::Body::ChannelUpdateBody(ChannelUpdateBody {
+                        channel_id: channel_id.clone(),
+                        name: Some("pets".to_string()),
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    MessageType::ChannelMember,
+                    message::message_data::Body::ChannelMemberBody(ChannelMemberBody {
+                        channel_id: channel_id.clone(),
+                        fid: 42,
+                        action: message::ChannelMemberAction::AddMember as i32,
+                    }),
+                ),
+                (
+                    MessageType::ChannelPin,
+                    message::message_data::Body::ChannelPinBody(ChannelPinBody {
+                        channel_id: channel_id.clone(),
+                        cast_hash: cast_hash.clone(),
+                    }),
+                ),
+                (
+                    MessageType::ChannelModerate,
+                    message::message_data::Body::ChannelModerateBody(ChannelModerateBody {
+                        channel_id,
+                        cast_hash,
+                        action: message::ChannelModerateAction::Hide as i32,
+                    }),
+                ),
+            ]
+        }
+    }
+
     pub mod verifications {
         use message::{VerificationAddAddressBody, VerificationRemoveBody};
 
@@ -1037,6 +1185,7 @@ pub mod shard_chunk_factory {
                 timestamp,
                 height: Some(Height::new(shard_id, height)),
                 shard_root: vec![],
+                transactions_root: vec![],
             }),
             hash: vec![],
             commits: None,
