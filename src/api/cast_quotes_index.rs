@@ -96,7 +96,8 @@ impl CastQuotesIndexer {
                         let hash = key[offset + 8..offset + 28].to_vec();
                         results.push((fid, hash));
                     }
-                    Ok(results.len() < limit)
+                    // `true` stops the iteration.
+                    Ok(results.len() >= limit)
                 },
             )
             .map_err(|e| IndexerError::Storage(e.to_string()))?;
@@ -278,5 +279,56 @@ impl Indexer for CastQuotesIndexer {
             backfill_complete: self.checkpoint.load(Ordering::SeqCst) > 0,
             size_bytes: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::factory::messages_factory;
+
+    #[test]
+    fn test_get_quotes_returns_every_quote() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(RocksDB::new(dir.path().to_str().unwrap()));
+        db.open().unwrap();
+        let indexer = CastQuotesIndexer::new(
+            FeatureConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db.clone(),
+        );
+
+        let target = vec![7u8; 20];
+        let mut txn = RocksDbTransactionBatch::new();
+        for fid in [2u64, 3, 4] {
+            let quote = messages_factory::casts::create_cast_add_rich(
+                fid,
+                "quote",
+                None,
+                vec![crate::proto::Embed {
+                    embed: Some(crate::proto::embed::Embed::CastId(crate::proto::CastId {
+                        fid: 1,
+                        hash: target.clone(),
+                    })),
+                }],
+                None,
+                vec![],
+                None,
+                None,
+            );
+            indexer.process_message(&quote, &mut txn);
+        }
+        db.commit(txn).unwrap();
+
+        let fids: Vec<u64> = indexer
+            .get_quotes(&target, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(fid, _)| fid)
+            .collect();
+        assert_eq!(fids, vec![2, 3, 4]);
+        assert_eq!(indexer.get_quotes(&target, 2).unwrap().len(), 2);
     }
 }

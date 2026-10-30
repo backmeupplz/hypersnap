@@ -7836,7 +7836,7 @@ mod tests {
         shard2_stores.db.commit(txn).unwrap();
 
         let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None)
+            .get_notifications(target_fid, 50, None, false, None)
             .await
             .unwrap();
         assert!(
@@ -7908,7 +7908,7 @@ mod tests {
         shard2_stores.db.commit(txn).unwrap();
 
         let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None)
+            .get_notifications(target_fid, 50, None, false, None)
             .await
             .unwrap();
         let has_reaction = messages.iter().any(|m| {
@@ -7961,7 +7961,7 @@ mod tests {
         shard2_stores.db.commit(txn).unwrap();
 
         let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None)
+            .get_notifications(target_fid, 50, None, false, None)
             .await
             .unwrap();
         let has_follow = messages.iter().any(|m| {
@@ -8016,7 +8016,10 @@ mod tests {
             .unwrap();
         shard1_stores.db.commit(txn).unwrap();
 
-        let (messages, _cursor) = service.get_notifications(fid, 50, None).await.unwrap();
+        let (messages, _cursor) = service
+            .get_notifications(fid, 50, None, false, None)
+            .await
+            .unwrap();
         let has_self_reaction = messages.iter().any(|m| {
             m.data.as_ref().map(|d| d.r#type).unwrap_or(0) == proto::MessageType::ReactionAdd as i32
                 && m.data.as_ref().map(|d| d.fid).unwrap_or(0) == fid
@@ -8096,7 +8099,7 @@ mod tests {
         }
 
         let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None)
+            .get_notifications(target_fid, 50, None, false, None)
             .await
             .unwrap();
 
@@ -8165,7 +8168,7 @@ mod tests {
         }
 
         let (messages, _cursor) = service
-            .get_notifications(target_fid, 3, None)
+            .get_notifications(target_fid, 3, None, false, None)
             .await
             .unwrap();
         assert_eq!(messages.len(), 3, "Should respect limit of 3");
@@ -8220,7 +8223,7 @@ mod tests {
 
         // Page 1
         let (page1, cursor1) = service
-            .get_notifications(target_fid, 2, None)
+            .get_notifications(target_fid, 2, None, false, None)
             .await
             .unwrap();
         assert_eq!(page1.len(), 2, "Page 1 should have 2 items");
@@ -8228,7 +8231,7 @@ mod tests {
 
         // Page 2
         let (page2, cursor2) = service
-            .get_notifications(target_fid, 2, cursor1.as_deref())
+            .get_notifications(target_fid, 2, cursor1.as_deref(), false, None)
             .await
             .unwrap();
         assert_eq!(page2.len(), 2, "Page 2 should have 2 items");
@@ -8236,7 +8239,7 @@ mod tests {
 
         // Page 3 (last page, 1 remaining)
         let (page3, cursor3) = service
-            .get_notifications(target_fid, 2, cursor2.as_deref())
+            .get_notifications(target_fid, 2, cursor2.as_deref(), false, None)
             .await
             .unwrap();
         assert_eq!(page3.len(), 1, "Page 3 should have 1 remaining item");
@@ -8270,7 +8273,10 @@ mod tests {
 
         test_helper::register_user(fid, signer.clone(), custody.clone(), &mut engine1).await;
 
-        let (messages, cursor) = service.get_notifications(fid, 50, None).await.unwrap();
+        let (messages, cursor) = service
+            .get_notifications(fid, 50, None, false, None)
+            .await
+            .unwrap();
         assert!(
             messages.is_empty(),
             "Expected empty notifications for new user"
@@ -8333,7 +8339,7 @@ mod tests {
         shard2_stores.db.commit(txn).unwrap();
 
         let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None)
+            .get_notifications(target_fid, 50, None, false, None)
             .await
             .unwrap();
         let reply_messages: Vec<_> = messages
@@ -8404,7 +8410,7 @@ mod tests {
         shard1_stores.db.commit(txn).unwrap();
 
         let (messages, _cursor) = service
-            .get_notifications(target_fid, 50, None)
+            .get_notifications(target_fid, 50, None, false, None)
             .await
             .unwrap();
         let self_replies: Vec<_> = messages
@@ -9212,5 +9218,190 @@ mod tests {
         // namespaces are absent and the API surfaces 0 / empty.
         assert_eq!(body.current_user_nonce, 0);
         assert!(body.requester_fid_nonces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_notifications_deep_replies_with_flag() {
+        use crate::api::HubQueryHandler;
+        let (
+            stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None, None).await;
+        let target_fid = SHARD1_FID;
+        let replier_fid = SHARD2_FID;
+        test_helper::register_user(
+            target_fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine1,
+        )
+        .await;
+        test_helper::register_user(
+            replier_fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        // target cast <- reply <- reply to the reply <- deeper reply. The user's
+        // own replies are casts of theirs, so the thread is all someone else's.
+        let target_cast =
+            messages_factory::casts::create_cast_add(target_fid, "my original cast", None, None);
+        let reply = messages_factory::casts::create_cast_with_parent(
+            replier_fid,
+            "reply",
+            target_fid,
+            &target_cast.hash,
+            None,
+            None,
+        );
+        let reply_to_reply = messages_factory::casts::create_cast_with_parent(
+            replier_fid,
+            "reply to the reply",
+            replier_fid,
+            &reply.hash,
+            None,
+            None,
+        );
+        let deeper_reply = messages_factory::casts::create_cast_with_parent(
+            replier_fid,
+            "deeper reply",
+            replier_fid,
+            &reply_to_reply.hash,
+            None,
+            None,
+        );
+        for (shard_id, cast) in [
+            (1u32, &target_cast),
+            (2u32, &reply),
+            (2u32, &reply_to_reply),
+            (2u32, &deeper_reply),
+        ] {
+            let shard_stores = stores.get(&shard_id).unwrap();
+            let mut txn = RocksDbTransactionBatch::new();
+            shard_stores
+                .cast_store
+                .merge(cast, &mut txn, &test_helper::default_merge_ctx())
+                .unwrap();
+            shard_stores.db.commit(txn).unwrap();
+        }
+        let deep = [&reply_to_reply.hash, &deeper_reply.hash];
+
+        let (messages, _cursor) = service
+            .get_notifications(target_fid, 50, None, false, None)
+            .await
+            .unwrap();
+        assert!(messages.iter().any(|m| m.hash == reply.hash));
+        assert!(!messages.iter().any(|m| deep.contains(&&m.hash)));
+
+        let (messages, _cursor) = service
+            .get_notifications(target_fid, 50, None, true, None)
+            .await
+            .unwrap();
+        assert!(messages.iter().any(|m| m.hash == reply.hash));
+        for hash in deep {
+            assert!(
+                messages.iter().any(|m| &m.hash == hash),
+                "Expected replies deeper in the thread with the flag"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notifications_quotes_with_flag() {
+        use crate::api::indexer::Indexer;
+        use crate::api::HubQueryHandler;
+        let (
+            stores,
+            _senders,
+            [mut engine1, mut engine2],
+            _block_engine,
+            service,
+            _shard_decision_tx,
+            _block_decision_tx,
+        ) = make_server(None, None).await;
+        let target_fid = SHARD1_FID;
+        let quoter_fid = SHARD2_FID;
+        test_helper::register_user(
+            target_fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine1,
+        )
+        .await;
+        test_helper::register_user(
+            quoter_fid,
+            test_helper::default_signer(),
+            test_helper::default_custody_address(),
+            &mut engine2,
+        )
+        .await;
+
+        let target_cast =
+            messages_factory::casts::create_cast_add(target_fid, "quote me", None, None);
+        let quote = messages_factory::casts::create_cast_add_rich(
+            quoter_fid,
+            "look at this",
+            None,
+            vec![proto::Embed {
+                embed: Some(proto::embed::Embed::CastId(proto::CastId {
+                    fid: target_fid,
+                    hash: target_cast.hash.clone(),
+                })),
+            }],
+            None,
+            vec![],
+            None,
+            None,
+        );
+        for (shard_id, cast) in [(1u32, &target_cast), (2u32, &quote)] {
+            let shard_stores = stores.get(&shard_id).unwrap();
+            let mut txn = RocksDbTransactionBatch::new();
+            shard_stores
+                .cast_store
+                .merge(cast, &mut txn, &test_helper::default_merge_ctx())
+                .unwrap();
+            shard_stores.db.commit(txn).unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(RocksDB::new(dir.path().to_str().unwrap()));
+        db.open().unwrap();
+        let quotes = crate::api::CastQuotesIndexer::new(
+            crate::api::config::FeatureConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            db,
+        );
+        quotes
+            .process_event(&crate::api::events::IndexEvent::message(
+                quote.clone(),
+                2,
+                0,
+            ))
+            .await
+            .unwrap();
+
+        let (messages, _cursor) = service
+            .get_notifications(target_fid, 50, None, false, Some(&quotes))
+            .await
+            .unwrap();
+        assert!(!messages.iter().any(|m| m.hash == quote.hash));
+
+        let (messages, _cursor) = service
+            .get_notifications(target_fid, 50, None, true, Some(&quotes))
+            .await
+            .unwrap();
+        assert!(
+            messages.iter().any(|m| m.hash == quote.hash),
+            "Expected the quote cast with the flag"
+        );
     }
 }

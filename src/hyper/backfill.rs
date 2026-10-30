@@ -75,7 +75,8 @@ pub async fn run_hyper_backfill(
 
         while height <= max_height {
             let end = (height + BATCH_SIZE).min(max_height);
-            let chunks = match stores.shard_store.get_shard_chunks(height, Some(end)) {
+            // The stop block is exclusive; `end` itself belongs to this batch.
+            let chunks = match stores.shard_store.get_shard_chunks(height, Some(end + 1)) {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(shard_id, height, error = %e, "Failed to get shard chunks");

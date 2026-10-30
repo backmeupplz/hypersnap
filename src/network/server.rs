@@ -685,6 +685,15 @@ const REACTIONS_PER_CAST_CAP: usize = 10;
 /// Per-shard reply cap (parent-based). Keep small to bound per-cast fan-out.
 const REPLIES_PER_CAST_CAP: usize = 10;
 
+/// Thread levels below the direct replies walked for deep reply notifications.
+const DEEP_REPLY_MAX_DEPTH: usize = 5;
+
+/// Newest replies per thread level whose own replies are looked up.
+const DEEP_REPLY_PARENTS_PER_LEVEL: usize = 100;
+
+/// Quotes per cast. The quotes index orders them by quoting FID, not time.
+const QUOTES_PER_CAST_CAP: usize = 10;
+
 impl MyHubService {
     pub fn new(
         rpc_auth: String,
@@ -4257,6 +4266,8 @@ impl crate::api::HubQueryHandler for MyHubService {
         fid: u64,
         limit: usize,
         cursor: Option<&str>,
+        include_quotes_and_deep_replies: bool,
+        quotes: Option<&crate::api::cast_quotes_index::CastQuotesIndexer>,
     ) -> Result<(Vec<Message>, Option<String>), String> {
         let mut notifications: Vec<Message> = Vec::new();
         let fetch_limit = limit.max(25);
@@ -4320,6 +4331,10 @@ impl crate::api::HubQueryHandler for MyHubService {
             }
         }
 
+        // Every reply under the user's casts (theirs too), to walk the threads
+        // deeper when asked to.
+        let mut thread_replies: Vec<Message> = Vec::new();
+
         // 4. Reactions and parent-based replies on user's casts —
         //    query across ALL shards for each target.
         for stores in self.shard_stores.values() {
@@ -4355,7 +4370,75 @@ impl crate::api::HubQueryHandler for MyHubService {
                     CastStore::get_casts_by_parent(&stores.cast_store, &parent, &reply_options)
                 {
                     for msg in replies.messages {
+                        if include_quotes_and_deep_replies {
+                            thread_replies.push(msg.clone());
+                        }
                         if msg.data.as_ref().map(|d| d.fid).unwrap_or(0) != fid {
+                            notifications.push(msg);
+                        }
+                    }
+                }
+            }
+        }
+
+        if include_quotes_and_deep_replies {
+            // 5. Replies deeper in the threads under the user's casts, level by
+            //    level, keeping the newest parents at each level.
+            for _ in 0..DEEP_REPLY_MAX_DEPTH {
+                thread_replies.sort_by_key(|m| {
+                    std::cmp::Reverse(m.data.as_ref().map(|d| d.timestamp).unwrap_or(0))
+                });
+                thread_replies.truncate(DEEP_REPLY_PARENTS_PER_LEVEL);
+                let mut next_level = Vec::new();
+                for reply in &thread_replies {
+                    let Some(data) = &reply.data else { continue };
+                    let parent = cast_add_body::Parent::ParentCastId(crate::proto::CastId {
+                        fid: data.fid,
+                        hash: reply.hash.clone(),
+                    });
+                    for stores in self.shard_stores.values() {
+                        let reply_options = PageOptions {
+                            page_size: Some(REPLIES_PER_CAST_CAP),
+                            page_token: None,
+                            reverse: true,
+                        };
+                        if let Ok(replies) = CastStore::get_casts_by_parent(
+                            &stores.cast_store,
+                            &parent,
+                            &reply_options,
+                        ) {
+                            next_level.extend(replies.messages);
+                        }
+                    }
+                }
+                if next_level.is_empty() {
+                    break;
+                }
+                notifications.extend(
+                    next_level
+                        .iter()
+                        .filter(|m| m.data.as_ref().map(|d| d.fid).unwrap_or(0) != fid)
+                        .cloned(),
+                );
+                thread_replies = next_level;
+            }
+
+            // 6. Casts quoting the user's casts.
+            if let Some(quotes) = quotes {
+                for cast_id in &cast_targets {
+                    let Ok(quoting) = quotes.get_quotes(&cast_id.hash, QUOTES_PER_CAST_CAP) else {
+                        continue;
+                    };
+                    for (quoter_fid, quote_hash) in quoting {
+                        if quoter_fid == fid {
+                            continue;
+                        }
+                        let Ok(stores) = self.get_stores_for(quoter_fid) else {
+                            continue;
+                        };
+                        if let Ok(Some(msg)) =
+                            CastStore::get_cast_add(&stores.cast_store, quoter_fid, quote_hash)
+                        {
                             notifications.push(msg);
                         }
                     }
