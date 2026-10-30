@@ -5,7 +5,9 @@ use crate::consensus::validator::StoredValidatorSets;
 use crate::core::error::HubError;
 use crate::core::types::{CommitsExt, Vote, FARCASTER_EPOCH};
 use crate::proto::{self};
+use crate::version::version::{EngineVersion, ProtocolFeature};
 use itertools::Itertools;
+use prost::Message;
 use tracing::error;
 
 #[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord)]
@@ -99,25 +101,74 @@ pub fn calculate_message_hash(data_bytes: &[u8]) -> Vec<u8> {
     blake3::hash(data_bytes).as_bytes()[0..20].to_vec()
 }
 
+/// Hash that commit certificates sign for a shard chunk: blake3 of the encoded header.
+pub fn shard_chunk_hash(header: &proto::ShardHeader) -> Vec<u8> {
+    blake3::hash(&header.encode_to_vec()).as_bytes().to_vec()
+}
+
+/// blake3 over a shard chunk's transactions in order, each length-delimited so that different
+/// transaction lists cannot encode to the same bytes.
+pub fn shard_transactions_hash(transactions: &[proto::Transaction]) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new();
+    for transaction in transactions {
+        hasher.update(&transaction.encode_length_delimited_to_vec());
+    }
+    hasher.finalize().as_bytes().to_vec()
+}
+
+/// The `transactions_root` a shard or block header must carry for `transactions` under `version`:
+/// their [`shard_transactions_hash`] once `HeaderTransactionsRoot` is enabled, empty before, so
+/// headers from earlier versions hash exactly as they did.
+pub fn expected_transactions_root(
+    transactions: &[proto::Transaction],
+    version: EngineVersion,
+) -> Vec<u8> {
+    if version.is_enabled(ProtocolFeature::HeaderTransactionsRoot) {
+        shard_transactions_hash(transactions)
+    } else {
+        vec![]
+    }
+}
+
+/// Hash that commit certificates sign for a block: blake3 of the encoded header.
+pub fn block_hash(header: &proto::BlockHeader) -> Vec<u8> {
+    blake3::hash(&header.encode_to_vec()).as_bytes().to_vec()
+}
+
+/// The `shard_witnesses_hash` committed to in a block header.
+pub fn shard_witness_hash(witness: &proto::ShardWitness) -> Vec<u8> {
+    blake3::hash(&witness.encode_to_vec()).as_bytes().to_vec()
+}
+
+/// The `events_hash` committed to in a block header. Empty when there are no events.
+pub fn block_events_hash(events: &[proto::BlockEvent]) -> Vec<u8> {
+    if events.is_empty() {
+        return vec![];
+    }
+    let mut events_hasher = blake3::Hasher::new();
+    for event in events {
+        events_hasher.update(&event.hash);
+    }
+    events_hasher.finalize().as_bytes().to_vec()
+}
+
+/// True if each event's hash covers its data and the events together hash to `events_hash`.
+pub fn block_events_match_hash(events: &[proto::BlockEvent], events_hash: &[u8]) -> bool {
+    let events_self_consistent = events.iter().all(|event| match &event.data {
+        Some(data) => event.hash == blake3::hash(&data.encode_to_vec()).as_bytes().to_vec(),
+        None => false,
+    });
+    events_self_consistent && block_events_hash(events) == events_hash
+}
+
+/// Verifies that `commits` is a quorum of valid precommits from the validator set. This only
+/// authenticates the certificate itself; callers must separately check that the certificate's
+/// height and value match the value it is attached to.
 pub fn verify_signatures(commits: &proto::Commits, validator_sets: &StoredValidatorSets) -> bool {
-    // F185 (F151 residual): use the fallible decoder. `to_commit_certificate`
-    // panics on peer-controlled inputs — missing `height`/`value`, or any
-    // `CommitSignature.signer` whose length is not 32 → `Address::from_vec`
-    // `copy_from_slice` abort. The decided-value path on read nodes
-    // receives `proto::Commits` via raw `proto::GossipMessage::decode`
-    // (`gossip.rs::map_gossip_bytes_to_system_message`) and the sync
-    // value-response path re-decodes the embedded `Block`/`ShardChunk`
-    // (`read_sync.rs` ValueResponse handler) — both bypass the codec
-    // arm that F151 made fallible, so any peer can crash every
-    // subscribed read-node pre-verify with a single gossip frame. Drop
-    // the block on Err rather than panicking the actor.
     let certificate = match commits.try_to_commit_certificate() {
-        Ok(c) => c,
-        Err(e) => {
-            error!(
-                error = e,
-                "Malformed Commits in verify_signatures; dropping"
-            );
+        Ok(certificate) => certificate,
+        Err(err) => {
+            error!("Malformed commits: {}", err);
             return false;
         }
     };
@@ -293,5 +344,18 @@ mod tests {
             signatures: vec![],
         };
         assert!(!verify_signatures(&commits, &sets));
+    }
+
+    #[test]
+    fn test_expected_transactions_root_is_empty_before_v23() {
+        let transactions = vec![proto::Transaction {
+            fid: 1,
+            ..Default::default()
+        }];
+        assert!(expected_transactions_root(&transactions, EngineVersion::V22).is_empty());
+        assert_eq!(
+            expected_transactions_root(&transactions, EngineVersion::V23),
+            shard_transactions_hash(&transactions)
+        );
     }
 }

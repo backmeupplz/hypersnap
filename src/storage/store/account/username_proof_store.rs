@@ -324,7 +324,7 @@ impl StoreDef for UsernameProofStoreDef {
             _ => None,
         };
 
-        let (deleted_proof_body, deleted_message) = if merge_conflicts.len() > 0 {
+        let (deleted_proof_body, deleted_message) = if !merge_conflicts.is_empty() {
             match &merge_conflicts[0].data {
                 Some(message_data) => match &message_data.body {
                     Some(Body::UsernameProofBody(username_proof_body)) => (

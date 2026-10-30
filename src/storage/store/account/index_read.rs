@@ -9,7 +9,7 @@
 
 use super::{
     get_from_db_or_txn, make_message_primary_key_with_prefix, message_decode, read_fid_key,
-    read_ts_hash, MessagesPage, TS_HASH_LENGTH,
+    read_ts_hash, MessagesPage, FID_BYTES, TS_HASH_LENGTH,
 };
 use crate::core::error::HubError;
 use crate::storage::db::{PageOptions, RocksDB, RocksDbTransactionBatch};
@@ -44,6 +44,11 @@ fn union_suffixes<F: Fn(&[u8]) -> bool>(
         .filter(|token| !token.is_empty())
         .map(|token| token[1..].to_vec());
 
+    // An entry is exactly `[root][tail][ts_hash][fid]`. Longer keys under the
+    // same prefix belong to a longer tail that starts with this one (a parent
+    // or target URL like `.../channel/dev-jobs` under `.../channel/dev`), so
+    // they are skipped rather than read as this tail's entries.
+    let entry_len = 1 + tail.len() + TS_HASH_LENGTH + FID_BYTES;
     let mut merged: Vec<Vec<u8>> = Vec::new();
     for &root in roots {
         let mut start = Vec::with_capacity(1 + tail.len());
@@ -57,7 +62,7 @@ fn union_suffixes<F: Fn(&[u8]) -> bool>(
         };
         let mut taken = 0usize;
         db.for_each_iterator_by_prefix(Some(start), Some(stop), &root_options, |key, value| {
-            if keep(value) {
+            if key.len() == entry_len && keep(value) {
                 merged.push(key[1..].to_vec());
                 taken += 1;
             }

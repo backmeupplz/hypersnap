@@ -138,11 +138,15 @@ pub trait HubQueryHandler: Send + Sync {
     async fn get_signer_events(&self, fid: u64) -> Result<Vec<crate::proto::OnChainEvent>, String>;
 
     /// Get notifications for a user (reactions + mentions on their casts + follows).
+    /// With `include_quotes_and_deep_replies`, also replies deeper in threads
+    /// under the user's casts and, when `quotes` is given, casts quoting them.
     async fn get_notifications(
         &self,
         fid: u64,
         limit: usize,
         cursor: Option<&str>,
+        include_quotes_and_deep_replies: bool,
+        quotes: Option<&crate::api::cast_quotes_index::CastQuotesIndexer>,
     ) -> Result<(Vec<crate::proto::Message>, Option<String>), String>;
 
     /// Get links by FID and link type (e.g. "follow", "block", "mute").
@@ -152,6 +156,18 @@ pub trait HubQueryHandler: Send + Sync {
         link_type: &str,
         limit: usize,
     ) -> Result<Vec<crate::proto::Message>, String>;
+
+    /// Whether `fid` has a live link of `link_type` (e.g. "follow") to `target_fid`.
+    async fn has_link(&self, fid: u64, link_type: &str, target_fid: u64) -> bool;
+
+    /// Whether `fid` has a live reaction of `reaction_type` on the cast `cast_fid`/`cast_hash`.
+    async fn has_reaction(
+        &self,
+        fid: u64,
+        reaction_type: i32,
+        cast_fid: u64,
+        cast_hash: &[u8],
+    ) -> bool;
 
     /// Get user data messages for a FID.
     async fn get_user_data_by_fid(&self, fid: u64) -> Result<Vec<crate::proto::Message>, String>;
@@ -287,6 +303,8 @@ const MISSING_CAST_TTL: std::time::Duration = std::time::Duration::from_secs(600
 const MISSING_CAST_CAPACITY: u64 = 100_000;
 /// Hashes per bulk cast request that may fall back to a full FID probe.
 const BULK_CAST_PROBE_LIMIT: usize = 3;
+/// Most parent hops `thread_hash` follows before giving up on a reply chain.
+const MAX_THREAD_HOPS: usize = 64;
 
 impl ApiHttpHandler {
     /// Create a new handler with optional indexers.
@@ -939,7 +957,7 @@ impl ApiHttpHandler {
             .unwrap_or(25)
             .min(100);
         let cursor = params.get("cursor").cloned();
-        let _viewer_fid: Option<u64> = params.get("viewer_fid").and_then(|s| s.parse().ok());
+        let viewer_fid: Option<u64> = params.get("viewer_fid").and_then(|s| s.parse().ok());
 
         // Helper macro for extracting required params
         macro_rules! require_param {
@@ -1110,7 +1128,8 @@ impl ApiHttpHandler {
                 let identifier = require_param!(params, "identifier");
                 let id_type = params.get("type").map(|s| s.as_str()).unwrap_or("hash");
                 let fid: Option<u64> = params.get("fid").and_then(|s| s.parse().ok());
-                self.handle_cast_lookup(&identifier, id_type, fid).await
+                self.handle_cast_lookup(&identifier, id_type, fid, viewer_fid)
+                    .await
             }
             "/v2/farcaster/cast/bulk" | "/v2/farcaster/casts" => {
                 // /casts uses "casts" param, /cast/bulk uses "hashes"
@@ -1125,7 +1144,7 @@ impl ApiHttpHandler {
                         "Missing required parameter: hashes or casts",
                     ));
                 }
-                self.handle_cast_bulk(&hashes).await
+                self.handle_cast_bulk(&hashes, viewer_fid).await
             }
             "/v2/farcaster/cast/search" => {
                 let q = require_param!(params, "q");
@@ -1161,7 +1180,7 @@ impl ApiHttpHandler {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(2)
                     .min(5);
-                self.handle_conversation(&identifier, &id_type, reply_depth)
+                self.handle_conversation(&identifier, &id_type, reply_depth, viewer_fid)
                     .await
             }
 
@@ -1188,6 +1207,7 @@ impl ApiHttpHandler {
                             limit,
                             window,
                             with_recasts,
+                            viewer_fid,
                         )
                         .await
                     }
@@ -1196,35 +1216,35 @@ impl ApiHttpHandler {
             "/v2/farcaster/feed/following" => {
                 let fid: u64 = require_fid!(params);
                 let with_recasts = params.get("with_recasts").is_some_and(|v| v == "true");
-                self.handle_following_feed(fid, cursor.as_deref(), limit, with_recasts)
+                self.handle_following_feed(fid, cursor.as_deref(), limit, with_recasts, viewer_fid)
                     .await
             }
             "/v2/farcaster/feed/trending" => {
                 let window = trending_window!(params);
-                self.handle_trending_feed(cursor.as_deref(), limit, window)
+                self.handle_trending_feed(cursor.as_deref(), limit, window, viewer_fid)
                     .await
             }
             "/v2/farcaster/feed/for_you" => {
                 // "For you" feed — alias to trending as personalization
                 // requires model inference not available on-node
                 let window = trending_window!(params);
-                self.handle_trending_feed(cursor.as_deref(), limit, window)
+                self.handle_trending_feed(cursor.as_deref(), limit, window, viewer_fid)
                     .await
             }
             "/v2/farcaster/feed/channels" => {
                 let channel_ids = require_param!(params, "channel_ids");
-                self.handle_channel_feed(&channel_ids, cursor.as_deref(), limit)
+                self.handle_channel_feed(&channel_ids, cursor.as_deref(), limit, viewer_fid)
                     .await
             }
             "/v2/farcaster/feed/parent_urls" => {
                 let parent_urls = require_param!(params, "parent_urls");
                 // Use the first parent_url as channel URL
-                self.handle_channel_feed(&parent_urls, cursor.as_deref(), limit)
+                self.handle_channel_feed(&parent_urls, cursor.as_deref(), limit, viewer_fid)
                     .await
             }
             "/v2/farcaster/feed/user/casts" => {
                 let fid: u64 = require_fid!(params);
-                self.handle_user_casts_feed(fid, cursor.as_deref(), limit)
+                self.handle_user_casts_feed(fid, cursor.as_deref(), limit, viewer_fid)
                     .await
             }
             "/v2/farcaster/feed/user/popular" => {
@@ -1234,7 +1254,7 @@ impl ApiHttpHandler {
             "/v2/farcaster/feed/topic" => {
                 // Topics alias to trending feed
                 let window = trending_window!(params);
-                self.handle_trending_feed(cursor.as_deref(), limit, window)
+                self.handle_trending_feed(cursor.as_deref(), limit, window, viewer_fid)
                     .await
             }
             "/v2/farcaster/feed/user/replies_and_recasts" => {
@@ -1307,8 +1327,16 @@ impl ApiHttpHandler {
             // === Notification endpoints ===
             "/v2/farcaster/notifications" => {
                 let fid: u64 = require_fid!(params);
-                self.handle_notifications(fid, cursor.as_deref(), limit)
-                    .await
+                let include_quotes_and_deep_replies = params
+                    .get("include_quotes_and_deep_replies")
+                    .is_some_and(|v| v == "true");
+                self.handle_notifications(
+                    fid,
+                    cursor.as_deref(),
+                    limit,
+                    include_quotes_and_deep_replies,
+                )
+                .await
             }
             "/v2/farcaster/notifications/channel" => {
                 let fid: u64 = require_fid!(params);
@@ -1436,7 +1464,7 @@ impl ApiHttpHandler {
 
             // === Status endpoints ===
             "/v2/farcaster/stats/daily" => {
-                self.handle_daily_stats(params.get("from"), params.get("to"))
+                self.handle_daily_stats(params.get("from"), params.get("to"), params.get("clients"))
                     .await
             }
             "/v2/farcaster/_status/halt" => self.handle_halt_status().await,
@@ -1738,6 +1766,7 @@ impl ApiHttpHandler {
         identifier: &str,
         id_type: &str,
         reply_depth: u32,
+        viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let handler = self.conversations.read().unwrap().clone();
         let Some(handler) = handler else {
@@ -1790,7 +1819,7 @@ impl ApiHttpHandler {
             .await
         {
             Ok(conversation) => {
-                let cast_with_replies = match self
+                let mut cast_with_replies = match self
                     .conversation_cast_to_cast_with_replies(&conversation.root)
                     .await
                 {
@@ -1799,6 +1828,8 @@ impl ApiHttpHandler {
                         return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e))
                     }
                 };
+                self.add_viewer_context_to_thread(&mut cast_with_replies, viewer_fid)
+                    .await;
 
                 let response = ConversationResponse {
                     conversation: Conversation {
@@ -1850,6 +1881,7 @@ impl ApiHttpHandler {
         cursor: Option<&str>,
         limit: usize,
         with_recasts: bool,
+        viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let handler = self.feeds.read().unwrap().clone();
         let Some(handler) = handler else {
@@ -1872,7 +1904,9 @@ impl ApiHttpHandler {
         {
             Ok(feed_response) => {
                 // Convert internal feed response to Farcaster format
-                let casts = self.convert_feed_items(&feed_response.items).await;
+                let casts = self
+                    .convert_feed_items(&feed_response.items, viewer_fid)
+                    .await;
                 let response = FeedResponse {
                     casts,
                     next: NextCursor {
@@ -1902,6 +1936,7 @@ impl ApiHttpHandler {
         cursor: Option<&str>,
         limit: usize,
         window: crate::api::feeds::TrendingWindow,
+        viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let handler = self.feeds.read().unwrap().clone();
         let Some(handler) = handler else {
@@ -1920,7 +1955,9 @@ impl ApiHttpHandler {
 
         match handler.get_trending_feed(cursor, limit, window).await {
             Ok(feed_response) => {
-                let casts = self.convert_feed_items(&feed_response.items).await;
+                let casts = self
+                    .convert_feed_items(&feed_response.items, viewer_fid)
+                    .await;
                 let response = FeedResponse {
                     casts,
                     next: NextCursor {
@@ -1970,6 +2007,7 @@ impl ApiHttpHandler {
         channel_ids: &str,
         cursor: Option<&str>,
         limit: usize,
+        viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let handler = {
             let guard = self.channel_feeds.read().unwrap();
@@ -2007,7 +2045,9 @@ impl ApiHttpHandler {
 
         match handler.get_channel_feed(&channel_url, cursor, limit).await {
             Ok(feed_response) => {
-                let casts = self.convert_feed_items(&feed_response.items).await;
+                let casts = self
+                    .convert_feed_items(&feed_response.items, viewer_fid)
+                    .await;
                 let next_cursor = feed_response.next_cursor.clone();
                 Ok(Self::json_response(
                     StatusCode::OK,
@@ -2107,6 +2147,8 @@ impl ApiHttpHandler {
             })
             .unwrap_or_default();
 
+        let thread_hash = self.thread_root(msg).await.map(hex::encode);
+
         Cast {
             object: "cast".to_string(),
             hash: hex::encode(&hash),
@@ -2121,7 +2163,7 @@ impl ApiHttpHandler {
             r#type: cast_type.to_string(),
             reactions: CastReactions::default(),
             replies: CastReplies::default(),
-            thread_hash: None,
+            thread_hash,
             mentioned_profiles,
             mentioned_profiles_ranges,
             mentioned_channels: Vec::new(),
@@ -2133,12 +2175,86 @@ impl ApiHttpHandler {
         }
     }
 
+    /// Hash of the conversation root above `msg`: its own hash for a
+    /// top-level cast, else the top-most ancestor reached through parent cast
+    /// ids. `None` when an ancestor is missing or the chain is longer than
+    /// `MAX_THREAD_HOPS`. Each hop is one cast store lookup by FID and hash.
+    async fn thread_root(&self, msg: &crate::proto::Message) -> Option<Vec<u8>> {
+        fn parent_of(msg: &crate::proto::Message) -> Option<crate::proto::CastId> {
+            match &msg.data.as_ref()?.body {
+                Some(crate::proto::message_data::Body::CastAddBody(body)) => match &body.parent {
+                    Some(crate::proto::cast_add_body::Parent::ParentCastId(id)) => Some(id.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+
+        let Some(mut parent) = parent_of(msg) else {
+            return Some(msg.hash.clone());
+        };
+        let hub = self.hub_query.read().unwrap().clone()?;
+        for _ in 0..MAX_THREAD_HOPS {
+            let ancestor = hub.get_cast_by_hash(&parent.hash, Some(parent.fid)).await?;
+            match parent_of(&ancestor) {
+                Some(next) => parent = next,
+                None => return Some(ancestor.hash),
+            }
+        }
+        None
+    }
+
+    /// Fill `viewer_context` on each cast (liked/recasted) and on its author
+    /// and mentioned profiles (follow and block links in both directions), as
+    /// seen by `viewer_fid`. Does nothing without a viewer.
+    async fn add_viewer_context(&self, casts: &mut [Cast], viewer_fid: Option<u64>) {
+        let Some(viewer) = viewer_fid else { return };
+        let Some(hub) = self.hub_query.read().unwrap().clone() else {
+            return;
+        };
+        for cast in casts {
+            let fid = cast.author.fid;
+            let hash = hex::decode(&cast.hash).unwrap_or_default();
+            let reacted = |kind: crate::proto::ReactionType| {
+                hub.has_reaction(viewer, kind as i32, fid, &hash)
+            };
+            cast.viewer_context = Some(types::CastViewerContext {
+                liked: reacted(crate::proto::ReactionType::Like).await,
+                recasted: reacted(crate::proto::ReactionType::Recast).await,
+            });
+            for user in std::iter::once(&mut cast.author).chain(&mut cast.mentioned_profiles) {
+                user.viewer_context = Some(types::ViewerContext {
+                    following: hub.has_link(viewer, "follow", user.fid).await,
+                    followed_by: hub.has_link(user.fid, "follow", viewer).await,
+                    blocking: hub.has_link(viewer, "block", user.fid).await,
+                    blocked_by: hub.has_link(user.fid, "block", viewer).await,
+                });
+            }
+        }
+    }
+
+    /// `add_viewer_context` for a conversation tree.
+    fn add_viewer_context_to_thread<'a>(
+        &'a self,
+        node: &'a mut CastWithReplies,
+        viewer_fid: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.add_viewer_context(std::slice::from_mut(&mut node.cast), viewer_fid)
+                .await;
+            for reply in &mut node.direct_replies {
+                self.add_viewer_context_to_thread(reply, viewer_fid).await;
+            }
+        })
+    }
+
     /// Handle GET /v2/farcaster/cast?identifier=X&type=hash|url&fid=N
     async fn handle_cast_lookup(
         &self,
         identifier: &str,
         id_type: &str,
         fid: Option<u64>,
+        viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         if self.hub_query.read().unwrap().is_none() {
             return Ok(Self::error_response(
@@ -2170,6 +2286,8 @@ impl ApiHttpHandler {
             if let Err(e) = self.attach_cast_metrics(&mut cast, &msg.hash).await {
                 return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, &e));
             }
+            self.add_viewer_context(std::slice::from_mut(&mut cast), viewer_fid)
+                .await;
             return Ok(Self::json_response(StatusCode::OK, &CastResponse { cast }));
         }
 
@@ -2183,6 +2301,7 @@ impl ApiHttpHandler {
     async fn handle_cast_bulk(
         &self,
         hashes_str: &str,
+        viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         if self.hub_query.read().unwrap().is_none() {
             return Ok(Self::error_response(
@@ -2210,6 +2329,7 @@ impl ApiHttpHandler {
             }
         }
 
+        self.add_viewer_context(&mut casts, viewer_fid).await;
         Ok(Self::json_response(
             StatusCode::OK,
             &BulkCastsResponse { casts },
@@ -2570,11 +2690,12 @@ impl ApiHttpHandler {
         limit: usize,
         window: crate::api::feeds::TrendingWindow,
         with_recasts: bool,
+        viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         match feed_type {
             "following" => {
                 if let Some(fid) = fid {
-                    self.handle_following_feed(fid, cursor, limit, with_recasts)
+                    self.handle_following_feed(fid, cursor, limit, with_recasts, viewer_fid)
                         .await
                 } else {
                     Ok(Self::error_response(
@@ -2583,7 +2704,10 @@ impl ApiHttpHandler {
                     ))
                 }
             }
-            _ => self.handle_trending_feed(cursor, limit, window).await,
+            _ => {
+                self.handle_trending_feed(cursor, limit, window, viewer_fid)
+                    .await
+            }
         }
     }
 
@@ -3082,12 +3206,13 @@ impl ApiHttpHandler {
         }
     }
 
-    /// Handle GET /v2/farcaster/notifications?fid=N
+    /// Handle GET /v2/farcaster/notifications?fid=N&include_quotes_and_deep_replies=true
     async fn handle_notifications(
         &self,
         fid: u64,
         cursor: Option<&str>,
         limit: usize,
+        include_quotes_and_deep_replies: bool,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let hub = self.hub_query.read().unwrap().clone();
         let Some(hub) = hub else {
@@ -3097,14 +3222,33 @@ impl ApiHttpHandler {
             ));
         };
 
-        match hub.get_notifications(fid, limit, cursor).await {
+        match hub
+            .get_notifications(
+                fid,
+                limit,
+                cursor,
+                include_quotes_and_deep_replies,
+                self.cast_quotes_index.as_deref(),
+            )
+            .await
+        {
             Ok((messages, next_cursor)) => {
                 let mut notifications = Vec::new();
                 for msg in &messages {
                     if let Some(data) = &msg.data {
                         let user = self.get_user(data.fid).await;
                         let notif_type = match crate::proto::MessageType::try_from(data.r#type) {
+                            Ok(crate::proto::MessageType::ReactionAdd)
+                                if include_quotes_and_deep_replies && is_recast(data) =>
+                            {
+                                "recasts"
+                            }
                             Ok(crate::proto::MessageType::ReactionAdd) => "likes",
+                            Ok(crate::proto::MessageType::CastAdd)
+                                if include_quotes_and_deep_replies && is_quote_of(data, fid) =>
+                            {
+                                "quote"
+                            }
                             Ok(crate::proto::MessageType::CastAdd) => "reply",
                             Ok(crate::proto::MessageType::LinkAdd) => "follows",
                             _ => "mention",
@@ -3206,7 +3350,10 @@ impl ApiHttpHandler {
         }
 
         // Fetch more notifications than needed so we can filter
-        match hub.get_notifications(fid, limit * 10, cursor).await {
+        match hub
+            .get_notifications(fid, limit * 10, cursor, false, None)
+            .await
+        {
             Ok((messages, next_cursor)) => {
                 let mut notifications = Vec::new();
                 for msg in &messages {
@@ -3317,7 +3464,10 @@ impl ApiHttpHandler {
 
         let target_urls: Vec<&str> = parent_urls_param.split(',').map(|s| s.trim()).collect();
 
-        match hub.get_notifications(fid, limit * 10, cursor).await {
+        match hub
+            .get_notifications(fid, limit * 10, cursor, false, None)
+            .await
+        {
             Ok((messages, next_cursor)) => {
                 let mut notifications = Vec::new();
                 for msg in &messages {
@@ -3499,11 +3649,16 @@ impl ApiHttpHandler {
     }
 
     /// Handle GET /v2/farcaster/_status/backfill
-    /// `GET /v2/farcaster/stats/daily?from=YYYY-MM-DD&to=YYYY-MM-DD`
+    /// `GET /v2/farcaster/stats/daily?from=YYYY-MM-DD&to=YYYY-MM-DD[&clients=N]`
     ///
     /// Node-derived replacement for the Dune daily-activity query. Both bounds
     /// are inclusive and optional: `to` defaults to yesterday, `from` to 30 days
     /// before `to`.
+    ///
+    /// `clients=N` (0..=100) adds a per-client breakdown to each day client
+    /// attribution covers, naming the N app fids with the most fid-days in the
+    /// range and folding the rest into `other`. Off by default, so existing
+    /// consumers see the same shape.
     ///
     /// `to` deliberately defaults to **yesterday**, not today. Today is still
     /// accumulating, so including it puts a partial day at the end of every
@@ -3514,8 +3669,11 @@ impl ApiHttpHandler {
         &self,
         from: Option<&String>,
         to: Option<&String>,
+        clients: Option<&String>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-        use crate::api::daily_stats::{date_string_to_day, day_to_date_string, today};
+        use crate::api::daily_stats::{
+            date_string_to_day, day_to_date_string, today, MAX_TOP_CLIENTS,
+        };
 
         let indexer = self.daily_stats.read().unwrap().clone();
         let Some(indexer) = indexer else {
@@ -3550,10 +3708,25 @@ impl ApiHttpHandler {
             },
             None => to_day.saturating_sub(29),
         };
+        let top_clients = match clients {
+            Some(s) => match s.trim().parse::<usize>() {
+                Ok(n) if n <= MAX_TOP_CLIENTS => Some(n),
+                _ => {
+                    return Ok(Self::error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "Invalid `clients`; expected an integer from 0 to {}",
+                            MAX_TOP_CLIENTS
+                        ),
+                    ))
+                }
+            },
+            None => None,
+        };
 
-        match indexer.range(from_day, to_day) {
+        match indexer.range_with_clients(from_day, to_day, top_clients) {
             Ok(days) => {
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "from": day_to_date_string(from_day),
                     "to": day_to_date_string(to_day),
                     "day_count": days.len(),
@@ -3564,6 +3737,17 @@ impl ApiHttpHandler {
                     },
                     "days": days,
                 });
+                if let Some(top) = top_clients {
+                    body["notes"]["clients"] = serde_json::json!({
+                        "tracked_from": indexer.clients_from_day().map(day_to_date_string),
+                        "top": top,
+                        "client": "the fid that requested the signer a message was signed with; \"self\" when that is the author's own fid; app fids outside the top N by fid-days in this range fold into \"other\"; \"unresolved\" when the signer was not found",
+                        "actions": "cast = top-level cast, reply = cast with a parent cast, like, recast, link = any LinkAdd, delete = cast/reaction/link remove, profile = UserDataAdd, verification = verification add or remove",
+                        "active_fids": "fids with at least one of those actions; unlike casts.unique_authors, not limited to casts",
+                        "retention": "per client, against exactly N days earlier: retained = used the client both days; retained_exclusive = used only that client both days; gained_from_other_clients = uses it now but N days earlier was active only elsewhere; lost_to_other_clients = the reverse. Windows reaching before tracked_from are null",
+                        "partial": "true on tracked_from, which is only counted from when the node started attributing",
+                    });
+                }
                 Ok(Self::json_response(StatusCode::OK, &body))
             }
             Err(crate::api::indexer::IndexerError::InvalidData(msg)) => {
@@ -3691,7 +3875,11 @@ impl ApiHttpHandler {
     }
 
     /// Convert internal feed items to Farcaster Cast format.
-    async fn convert_feed_items(&self, feed_items: &[crate::api::feeds::FeedItem]) -> Vec<Cast> {
+    async fn convert_feed_items(
+        &self,
+        feed_items: &[crate::api::feeds::FeedItem],
+        viewer_fid: Option<u64>,
+    ) -> Vec<Cast> {
         let mut casts = Vec::with_capacity(feed_items.len());
         for item in feed_items {
             let mut cast = self.message_to_cast(&item.cast).await;
@@ -3709,6 +3897,7 @@ impl ApiHttpHandler {
             }
             casts.push(cast);
         }
+        self.add_viewer_context(&mut casts, viewer_fid).await;
         casts
     }
 
@@ -4114,6 +4303,7 @@ impl ApiHttpHandler {
         fid: u64,
         cursor: Option<&str>,
         limit: usize,
+        viewer_fid: Option<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let hub = self.hub_query.read().unwrap().clone();
         let Some(hub) = hub else {
@@ -4147,6 +4337,7 @@ impl ApiHttpHandler {
                         }
                     }
                 }
+                self.add_viewer_context(&mut casts, viewer_fid).await;
                 let response = FeedResponse {
                     casts,
                     next: NextCursor {
@@ -4808,6 +4999,33 @@ fn format_timestamp(ts: u32) -> String {
         .unwrap_or_else(|| ts.to_string())
 }
 
+/// Whether a reaction message is a recast.
+fn is_recast(data: &crate::proto::MessageData) -> bool {
+    matches!(
+        &data.body,
+        Some(crate::proto::message_data::Body::ReactionBody(body))
+            if body.r#type == crate::proto::ReactionType::Recast as i32
+    )
+}
+
+/// Whether a cast quotes a cast by `fid` without being a direct reply to one.
+fn is_quote_of(data: &crate::proto::MessageData, fid: u64) -> bool {
+    let Some(crate::proto::message_data::Body::CastAddBody(body)) = &data.body else {
+        return false;
+    };
+    let replies_to_fid = matches!(
+        &body.parent,
+        Some(crate::proto::cast_add_body::Parent::ParentCastId(parent)) if parent.fid == fid
+    );
+    !replies_to_fid
+        && body.embeds.iter().any(|embed| {
+            matches!(
+                &embed.embed,
+                Some(crate::proto::embed::Embed::CastId(quoted)) if quoted.fid == fid
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4887,7 +5105,7 @@ mod tests {
     #[tokio::test]
     async fn test_daily_stats_unavailable_when_not_enabled() {
         let handler = ApiHttpHandler::new(None, None, None, None, None, None);
-        let response = handler.handle_daily_stats(None, None).await.unwrap();
+        let response = handler.handle_daily_stats(None, None, None).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -4911,17 +5129,41 @@ mod tests {
         )));
 
         let bad = "2026-13-99".to_string();
-        let response = handler.handle_daily_stats(Some(&bad), None).await.unwrap();
+        let response = handler
+            .handle_daily_stats(Some(&bad), None, None)
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         // Inverted range is a client error, not a 500.
         let from = "2026-08-10".to_string();
         let to = "2026-08-01".to_string();
         let response = handler
-            .handle_daily_stats(Some(&from), Some(&to))
+            .handle_daily_stats(Some(&from), Some(&to), None)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // `clients` must be a small non-negative integer.
+        for bad in ["-1", "101", "all"] {
+            let bad = bad.to_string();
+            let response = handler
+                .handle_daily_stats(None, None, Some(&bad))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "clients={}",
+                bad
+            );
+        }
+        let ok = "5".to_string();
+        let response = handler
+            .handle_daily_stats(None, None, Some(&ok))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
@@ -5172,12 +5414,19 @@ mod tests {
     use async_trait::async_trait;
     use http_body_util::BodyExt;
 
+    #[derive(Default)]
     struct MockHubQuery {
         notifications: Vec<crate::proto::Message>,
         cast_lookup: Option<crate::proto::Message>,
+        /// Casts found by hash; `cast_lookup` answers every other hash.
+        casts: Vec<crate::proto::Message>,
         direct_reply_count: u64,
         /// Calls to `get_cast_by_hash` without an FID, i.e. full FID probes.
         probes: std::sync::atomic::AtomicUsize,
+        /// Live links as (fid, link type, target fid).
+        links: Vec<(u64, &'static str, u64)>,
+        /// Live reactions as (fid, reaction type, cast hash).
+        reactions: Vec<(u64, i32, Vec<u8>)>,
     }
 
     #[async_trait]
@@ -5188,14 +5437,33 @@ mod tests {
 
         async fn get_cast_by_hash(
             &self,
-            _hash: &[u8],
+            hash: &[u8],
             fid_hint: Option<u64>,
         ) -> Option<crate::proto::Message> {
             if fid_hint.is_none() {
                 self.probes
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            self.cast_lookup.clone()
+            self.casts
+                .iter()
+                .find(|m| m.hash == hash)
+                .or(self.cast_lookup.as_ref())
+                .cloned()
+        }
+
+        async fn has_link(&self, fid: u64, link_type: &str, target_fid: u64) -> bool {
+            self.links.contains(&(fid, link_type, target_fid))
+        }
+
+        async fn has_reaction(
+            &self,
+            fid: u64,
+            reaction_type: i32,
+            _cast_fid: u64,
+            cast_hash: &[u8],
+        ) -> bool {
+            self.reactions
+                .contains(&(fid, reaction_type, cast_hash.to_vec()))
         }
 
         async fn get_casts_by_fid(
@@ -5263,6 +5531,8 @@ mod tests {
             _fid: u64,
             _limit: usize,
             _cursor: Option<&str>,
+            _include_quotes_and_deep_replies: bool,
+            _quotes: Option<&crate::api::cast_quotes_index::CastQuotesIndexer>,
         ) -> Result<(Vec<crate::proto::Message>, Option<String>), String> {
             Ok((self.notifications.clone(), None))
         }
@@ -5368,6 +5638,7 @@ mod tests {
             cast_lookup: None,
             direct_reply_count: 0,
             probes: Default::default(),
+            ..Default::default()
         }));
         handler.set_user_search(index);
 
@@ -5404,6 +5675,7 @@ mod tests {
             cast_lookup: None,
             direct_reply_count: 0,
             probes: Default::default(),
+            ..Default::default()
         });
         handler.set_hub_query(mock.clone());
         let probes = || mock.probes.load(std::sync::atomic::Ordering::Relaxed);
@@ -5441,6 +5713,7 @@ mod tests {
             cast_lookup: Some(mock_cast(42, hash.clone())),
             direct_reply_count: 0,
             probes: Default::default(),
+            ..Default::default()
         });
         handler.set_hub_query(mock.clone());
         let probes = || mock.probes.load(std::sync::atomic::Ordering::Relaxed);
@@ -5527,10 +5800,11 @@ mod tests {
             cast_lookup: Some(cast),
             direct_reply_count: 1,
             probes: Default::default(),
+            ..Default::default()
         }));
 
         let response = handler
-            .handle_cast_lookup(&hex::encode(cast_hash), "hash", None)
+            .handle_cast_lookup(&hex::encode(cast_hash), "hash", None, None)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -5548,6 +5822,122 @@ mod tests {
             .unwrap();
         assert!(shallow.direct_replies.is_empty());
         assert_eq!(shallow.cast.replies.count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_thread_hash_walks_to_the_root() {
+        use crate::utils::factory::messages_factory::casts;
+
+        let root = casts::create_cast_add(1, "root", None, None);
+        let reply = casts::create_cast_with_parent(2, "reply", 1, &root.hash, None, None);
+        let deep = casts::create_cast_with_parent(3, "deep", 2, &reply.hash, None, None);
+        let orphan = casts::create_cast_with_parent(4, "orphan", 9, &vec![9u8; 20], None, None);
+        let mut looped = casts::create_cast_add(5, "loop", None, None);
+        looped.hash = vec![5u8; 20];
+        if let Some(crate::proto::message_data::Body::CastAddBody(body)) =
+            &mut looped.data.as_mut().unwrap().body
+        {
+            body.parent = Some(crate::proto::cast_add_body::Parent::ParentCastId(
+                crate::proto::CastId {
+                    fid: 5,
+                    hash: looped.hash.clone(),
+                },
+            ));
+        }
+
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_hub_query(Arc::new(MockHubQuery {
+            casts: vec![root.clone(), reply.clone(), looped.clone()],
+            ..Default::default()
+        }));
+
+        let thread_hash = |msg| {
+            let handler = handler.clone();
+            async move { handler.message_to_cast(&msg).await.thread_hash }
+        };
+        let root_hex = Some(hex::encode(&root.hash));
+        assert_eq!(
+            thread_hash(root).await,
+            root_hex,
+            "a root is its own thread"
+        );
+        assert_eq!(thread_hash(reply).await, root_hex);
+        assert_eq!(thread_hash(deep).await, root_hex);
+        assert_eq!(thread_hash(orphan).await, None, "missing ancestor");
+        assert_eq!(thread_hash(looped).await, None, "hop limit");
+    }
+
+    #[tokio::test]
+    async fn test_viewer_context_only_with_viewer_fid() {
+        use crate::proto::ReactionType;
+        use crate::utils::factory::messages_factory::casts;
+
+        let (author, mentioned, viewer) = (10, 11, 20);
+        let cast = casts::create_cast_add_rich(
+            author,
+            "hi",
+            None,
+            vec![],
+            None,
+            vec![mentioned],
+            None,
+            None,
+        );
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_hub_query(Arc::new(MockHubQuery {
+            cast_lookup: Some(cast.clone()),
+            links: vec![
+                (viewer, "follow", author),
+                (mentioned, "follow", viewer),
+                (viewer, "block", mentioned),
+            ],
+            reactions: vec![(viewer, ReactionType::Like as i32, cast.hash.clone())],
+            ..Default::default()
+        }));
+        let lookup = |viewer_fid| {
+            let handler = handler.clone();
+            let hash = hex::encode(&cast.hash);
+            async move {
+                let response = handler
+                    .handle_cast_lookup(&hash, "hash", Some(author), viewer_fid)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                collect_json(response).await["cast"].clone()
+            }
+        };
+
+        let json = lookup(Some(viewer)).await;
+        assert_eq!(
+            json["viewer_context"],
+            serde_json::json!({"liked": true, "recasted": false})
+        );
+        assert_eq!(
+            json["author"]["viewer_context"],
+            serde_json::json!({
+                "following": true,
+                "followed_by": false,
+                "blocking": false,
+                "blocked_by": false,
+            })
+        );
+        assert_eq!(
+            json["mentioned_profiles"][0]["viewer_context"],
+            serde_json::json!({
+                "following": false,
+                "followed_by": true,
+                "blocking": true,
+                "blocked_by": false,
+            })
+        );
+        assert_eq!(json["thread_hash"], hex::encode(&cast.hash));
+
+        let json = lookup(None).await;
+        assert!(json.get("viewer_context").is_none());
+        assert!(json["author"].get("viewer_context").is_none());
+        assert!(json["mentioned_profiles"][0]
+            .get("viewer_context")
+            .is_none());
     }
 
     #[tokio::test]
@@ -5578,6 +5968,8 @@ mod tests {
                             },
                         )),
                         r#type: crate::proto::CastType::Cast as i32,
+                        format_version: 0,
+                        chain: None,
                     },
                 )),
             }),
@@ -5656,6 +6048,8 @@ mod tests {
                         embeds_deprecated: vec![],
                         parent: None,
                         r#type: crate::proto::CastType::Cast as i32,
+                        format_version: 0,
+                        chain: None,
                     },
                 )),
             }),
@@ -5672,12 +6066,15 @@ mod tests {
             cast_lookup: Some(target_cast_msg),
             direct_reply_count: 0,
             probes: Default::default(),
+            ..Default::default()
         });
 
         let handler = ApiHttpHandler::new(None, None, None, None, None, None);
         handler.set_hub_query(mock);
 
-        let response = handler.handle_notifications(target_fid, None, 10).await;
+        let response = handler
+            .handle_notifications(target_fid, None, 10, false)
+            .await;
         let response = response.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -5738,5 +6135,66 @@ mod tests {
             follower_fid,
             "follow user should be follower"
         );
+    }
+
+    #[tokio::test]
+    async fn test_notifications_quote_and_recast_types_with_flag() {
+        let target_fid: u64 = 121;
+        let target_cast_id = crate::proto::CastId {
+            fid: target_fid,
+            hash: vec![5, 6, 7],
+        };
+
+        let mut quote = mock_cast(122, vec![1]);
+        if let Some(crate::proto::message_data::Body::CastAddBody(body)) =
+            &mut quote.data.as_mut().unwrap().body
+        {
+            body.embeds.push(crate::proto::Embed {
+                embed: Some(crate::proto::embed::Embed::CastId(target_cast_id.clone())),
+            });
+        }
+        let recast = crate::proto::Message {
+            data: Some(crate::proto::MessageData {
+                fid: 123,
+                r#type: crate::proto::MessageType::ReactionAdd as i32,
+                body: Some(crate::proto::message_data::Body::ReactionBody(
+                    crate::proto::ReactionBody {
+                        r#type: crate::proto::ReactionType::Recast as i32,
+                        target: Some(crate::proto::reaction_body::Target::TargetCastId(
+                            target_cast_id.clone(),
+                        )),
+                    },
+                )),
+                ..Default::default()
+            }),
+            hash: vec![2],
+            ..Default::default()
+        };
+
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
+        handler.set_hub_query(Arc::new(MockHubQuery {
+            notifications: vec![quote, recast],
+            cast_lookup: Some(mock_cast(target_fid, target_cast_id.hash)),
+            direct_reply_count: 0,
+            probes: Default::default(),
+        }));
+
+        for (flag, expected) in [(false, ["reply", "likes"]), (true, ["quote", "recasts"])] {
+            let response = handler
+                .handle_notifications(target_fid, None, 10, flag)
+                .await
+                .unwrap();
+            let json = collect_json(response).await;
+            let notifications = json["notifications"].as_array().unwrap();
+            let types: Vec<&str> = notifications
+                .iter()
+                .map(|n| n["type"].as_str().unwrap())
+                .collect();
+            assert_eq!(types, expected);
+            assert_eq!(notifications[0]["user"]["fid"], 122);
+            assert_eq!(notifications[0]["cast"]["hash"], "01");
+            assert_eq!(notifications[1]["user"]["fid"], 123);
+            assert_eq!(notifications[1]["cast"]["author"]["fid"], target_fid);
+        }
     }
 }

@@ -26,12 +26,30 @@
 //! do not count. Computed at read time by intersecting stored fid sets, so the
 //! windows can change without a reindex.
 //!
+//! # Client attribution
+//!
+//! Every user message is signed by a key that some fid asked the user to
+//! approve: the `requestFid` in the key's `SignedKeyRequest` metadata, on an
+//! onchain `KeyRegistry` add or a gasless `KEY_ADD`. That requesting fid is the
+//! only client identity the protocol records, so it is what "client" means
+//! here: the app fid, or `self` when the author requested its own key.
+//!
+//! For each day, every active fid's clients and what it did with each are
+//! stored in full (see [`client_profile`]). Exclusivity, combinations,
+//! per-client retention and action splits are all derived from that at read
+//! time, so their definitions can change without a reindex. Attribution starts
+//! on the first day a node runs with it ([`keys::CLIENTS_FROM`]); earlier days
+//! have no client data, and the store-walk backfill never attributes.
+//!
 //! # Storage schema
 //!
 //! Keys are prefixed with [`keys::DAILY_STATS_PREFIX`] (0xEA):
 //! - `[prefix][0x01][day:4]`            -> `DailyCounters` (JSON)
 //! - `[prefix][0x02][set_kind:1][day:4]` -> encoded fid set
 //! - `[prefix][0x03][hll_kind:1][day:4]` -> HLL registers
+//! - `[prefix][0x04][day:4]`            -> client profile (see [`client_profile`])
+//! - `[prefix][0x05][day:4]`            -> `ClientDayCounters` (JSON)
+//! - `[prefix][0xFB]`                    -> first attributed day:4
 //! - `[prefix][0xFF]`                    -> checkpoint:8
 //!
 //! `day` is days since the Unix epoch, big-endian, so a prefix scan is in date
@@ -40,14 +58,17 @@
 use crate::api::config::DailyStatsConfig;
 use crate::api::events::{IndexEvent, MessageEventKind};
 use crate::api::indexer::{Indexer, IndexerError, IndexerStats};
+use crate::connectors::onchain_events::get_request_fid_from_signer_event;
 use crate::core::util::from_farcaster_time;
 use crate::proto::message_data::Body;
-use crate::proto::{Message, MessageType};
+use crate::proto::{on_chain_event, Message, MessageType};
 use crate::storage::db::{RocksDB, RocksDbTransactionBatch};
+use crate::storage::store::account::{get_gasless_key_record, OnchainEventStore};
+use crate::storage::store::stores::Stores;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const SECONDS_PER_DAY: u64 = 86_400;
@@ -57,6 +78,16 @@ const SECONDS_PER_DAY: u64 = 86_400;
 /// pulls in 30 more days, so an unbounded range is a cheap way to stall a
 /// worker. A little over a year is well past any dashboard's needs.
 pub const MAX_RANGE_DAYS: u32 = 400;
+
+/// Most app fids a client breakdown shows by name; the rest fold into `other`.
+pub const MAX_TOP_CLIENTS: usize = 100;
+
+/// Longest `combinations` / `top_patterns` list in one day's client breakdown.
+const TOP_GROUPS: usize = 25;
+
+/// Distinct `(fid, signer)` pairs the attribution cache holds before it is
+/// cleared. A few days of active keys at current volume.
+const SIGNER_CACHE_CAPACITY: usize = 200_000;
 
 /// Version of the stored rollups' *meaning*, not their encoding.
 ///
@@ -84,6 +115,11 @@ mod keys {
     pub const COUNTERS: u8 = 0x01;
     pub const FID_SET: u8 = 0x02;
     pub const HLL: u8 = 0x03;
+    pub const CLIENT_PROFILE: u8 = 0x04;
+    pub const CLIENT_COUNTERS: u8 = 0x05;
+    /// First day client attribution ran on this node. Earlier days have no
+    /// client data, and on this day attribution started partway through.
+    pub const CLIENTS_FROM: u8 = 0xFB;
     /// Version stamp for the *data layout and semantics* under this prefix.
     /// Mismatch against [`super::DATA_VERSION`] wipes everything and re-backfills.
     pub const DATA_VERSION: u8 = 0xFC;
@@ -287,6 +323,269 @@ mod hll {
 }
 
 // ---------------------------------------------------------------------------
+// client attribution
+// ---------------------------------------------------------------------------
+
+/// The client behind a message: whoever requested the key that signed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Client {
+    /// The author requested its own key.
+    SelfSigned,
+    /// The signer was not found in either key store.
+    Unresolved,
+    /// Requested by this app fid.
+    App(u64),
+}
+
+impl Client {
+    /// Stored form: 0 = self, 1 = unresolved, `fid + 2` = app.
+    fn code(self) -> u64 {
+        match self {
+            Client::SelfSigned => 0,
+            Client::Unresolved => 1,
+            Client::App(fid) => fid.saturating_add(2),
+        }
+    }
+
+    fn from_code(code: u64) -> Self {
+        match code {
+            0 => Client::SelfSigned,
+            1 => Client::Unresolved,
+            n => Client::App(n - 2),
+        }
+    }
+}
+
+/// What a fid did with a client, as bits of a per-(fid, client, day) mask.
+mod action {
+    use crate::proto::cast_add_body::Parent;
+    use crate::proto::message_data::Body;
+    use crate::proto::{MessageData, MessageType, ReactionType};
+
+    /// Top-level cast, with or without a parent_url.
+    pub const CAST: u16 = 1 << 0;
+    /// Cast with a parent cast.
+    pub const REPLY: u16 = 1 << 1;
+    pub const LIKE: u16 = 1 << 2;
+    pub const RECAST: u16 = 1 << 3;
+    /// LinkAdd of any link type, matching the `links` counters.
+    pub const LINK: u16 = 1 << 4;
+    /// CastRemove, ReactionRemove or LinkRemove.
+    pub const DELETE: u16 = 1 << 5;
+    /// UserDataAdd.
+    pub const PROFILE: u16 = 1 << 6;
+    /// VerificationAddEthAddress or VerificationRemove.
+    pub const VERIFICATION: u16 = 1 << 7;
+
+    /// Names in bit order: `NAMES[i]` names bit `1 << i`.
+    pub const NAMES: [&str; 8] = [
+        "cast",
+        "reply",
+        "like",
+        "recast",
+        "link",
+        "delete",
+        "profile",
+        "verification",
+    ];
+    pub const COUNT: usize = NAMES.len();
+
+    /// The action bit for a message, or `None` for messages that are not client
+    /// activity (custody-signed key and storage messages, username proofs).
+    pub fn of(data: &MessageData) -> Option<u16> {
+        match MessageType::try_from(data.r#type).ok()? {
+            MessageType::CastAdd => match data.body.as_ref()? {
+                Body::CastAddBody(body) => match &body.parent {
+                    Some(Parent::ParentCastId(_)) => Some(REPLY),
+                    _ => Some(CAST),
+                },
+                _ => None,
+            },
+            MessageType::ReactionAdd => match data.body.as_ref()? {
+                Body::ReactionBody(body) => match ReactionType::try_from(body.r#type).ok()? {
+                    ReactionType::Like => Some(LIKE),
+                    ReactionType::Recast => Some(RECAST),
+                    ReactionType::None => None,
+                },
+                _ => None,
+            },
+            MessageType::LinkAdd => Some(LINK),
+            MessageType::CastRemove | MessageType::ReactionRemove | MessageType::LinkRemove => {
+                Some(DELETE)
+            }
+            MessageType::UserDataAdd => Some(PROFILE),
+            MessageType::VerificationAddEthAddress | MessageType::VerificationRemove => {
+                Some(VERIFICATION)
+            }
+            _ => None,
+        }
+    }
+
+    /// Index into [`NAMES`] for a single-bit mask.
+    pub fn index(bit: u16) -> usize {
+        bit.trailing_zeros() as usize
+    }
+
+    /// Names of the bits set in `mask`, in bit order.
+    pub fn names(mask: u16) -> Vec<&'static str> {
+        NAMES
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1 << i) != 0)
+            .map(|(_, name)| *name)
+            .collect()
+    }
+}
+
+/// Per-day client profile: every attributed fid, each client it used, and the
+/// actions it took with each.
+///
+/// Fids ascending, each written as `fid delta`, `client count`, then that many
+/// `(client code, action mask)` pairs, all LEB128 varints. Kept per fid rather
+/// than as per-client counts because exclusivity, combinations and per-client
+/// retention all depend on which fids overlap.
+mod client_profile {
+    use std::collections::BTreeMap;
+
+    /// fid -> client code -> action mask.
+    pub type Profile = BTreeMap<u64, BTreeMap<u64, u16>>;
+
+    fn put(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    fn get(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+        let mut v = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let b = *bytes.get(*pos)?;
+            *pos += 1;
+            if shift >= 64 {
+                return None;
+            }
+            v |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Some(v);
+            }
+            shift += 7;
+        }
+    }
+
+    pub fn encode(profile: &Profile) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut prev = 0u64;
+        for (&fid, clients) in profile {
+            put(&mut out, fid - prev);
+            prev = fid;
+            put(&mut out, clients.len() as u64);
+            for (&client, &mask) in clients {
+                put(&mut out, client);
+                put(&mut out, mask as u64);
+            }
+        }
+        out
+    }
+
+    /// Decodes up to the first malformed entry, so a damaged value loses its
+    /// tail rather than the whole day.
+    pub fn decode(bytes: &[u8]) -> Profile {
+        let mut profile = Profile::new();
+        let mut pos = 0usize;
+        let mut fid = 0u64;
+        while pos < bytes.len() {
+            let (Some(delta), Some(n)) = (get(bytes, &mut pos), get(bytes, &mut pos)) else {
+                break;
+            };
+            fid = fid.saturating_add(delta);
+            let mut clients = BTreeMap::new();
+            for _ in 0..n {
+                let (Some(client), Some(mask)) = (get(bytes, &mut pos), get(bytes, &mut pos))
+                else {
+                    return profile;
+                };
+                clients.insert(client, mask as u16);
+            }
+            profile.insert(fid, clients);
+        }
+        profile
+    }
+}
+
+/// Additive per-client counters for one day.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct ClientDayCounters {
+    /// Client code -> messages per action, indexed like [`action::NAMES`].
+    messages: BTreeMap<u64, Vec<u64>>,
+    /// Client code -> fids that used it. Recomputed from the merged profile on
+    /// every write, so it is exact; stored so ranking clients across a range
+    /// does not have to decode every profile.
+    active_fids: BTreeMap<u64, u64>,
+}
+
+/// Finds the fid that requested a signer, i.e. the app the user approved the
+/// key for. A trait so tests can attribute without building key stores.
+pub trait SignerRequesterLookup: Send + Sync {
+    /// `None` when `signer` is not an active key for `fid` in any store.
+    fn requester_fid(&self, shard_id: u32, fid: u64, signer: &[u8]) -> Option<u64>;
+}
+
+/// Resolves signers in the order message validation does: the onchain
+/// `KeyRegistry` add first (its `SignedKeyRequest` metadata), then the gasless
+/// `KEY_ADD` record (its verified `requestFid`).
+pub struct StoreSignerRequesterLookup {
+    shards: Vec<(u32, OnchainEventStore, Arc<RocksDB>)>,
+}
+
+impl StoreSignerRequesterLookup {
+    pub fn new(shard_stores: &HashMap<u32, Stores>) -> Self {
+        Self::from_shards(
+            shard_stores
+                .iter()
+                .map(|(id, s)| (*id, s.onchain_event_store.clone(), s.db.clone()))
+                .collect(),
+        )
+    }
+
+    fn from_shards(mut shards: Vec<(u32, OnchainEventStore, Arc<RocksDB>)>) -> Self {
+        shards.sort_by_key(|(id, ..)| *id);
+        Self { shards }
+    }
+
+    fn lookup(onchain: &OnchainEventStore, db: &RocksDB, fid: u64, signer: &[u8]) -> Option<u64> {
+        if let Ok(Some(event)) = onchain.get_active_signer(fid, signer.to_vec(), None) {
+            if let Some(on_chain_event::Body::SignerEventBody(body)) = &event.body {
+                if let Some(requester) = get_request_fid_from_signer_event(body) {
+                    return Some(requester);
+                }
+            }
+        }
+        get_gasless_key_record(db, &RocksDbTransactionBatch::new(), fid, signer)
+            .ok()
+            .flatten()
+            .map(|record| record.request_fid)
+    }
+}
+
+impl SignerRequesterLookup for StoreSignerRequesterLookup {
+    fn requester_fid(&self, shard_id: u32, fid: u64, signer: &[u8]) -> Option<u64> {
+        // The message's own shard validated this signer against its stores when
+        // it merged, so ask it first; the other shards are fallbacks.
+        let own = self.shards.iter().filter(|(id, ..)| *id == shard_id);
+        let others = self.shards.iter().filter(|(id, ..)| *id != shard_id);
+        own.chain(others)
+            .find_map(|(_, onchain, db)| Self::lookup(onchain, db, fid, signer))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // in-memory accumulation
 // ---------------------------------------------------------------------------
 
@@ -300,6 +599,10 @@ struct DayAccumulator {
     counters: DailyCounters,
     sets: HashMap<u8, HashSet<u64>>,
     hlls: HashMap<u8, Vec<u8>>,
+    /// Attributed messages only.
+    clients: client_profile::Profile,
+    /// Client code -> messages per action.
+    client_messages: BTreeMap<u64, [u64; action::COUNT]>,
 }
 
 impl DayAccumulator {
@@ -308,7 +611,26 @@ impl DayAccumulator {
             counters: DailyCounters::default(),
             sets: HashMap::new(),
             hlls: HashMap::new(),
+            clients: client_profile::Profile::new(),
+            client_messages: BTreeMap::new(),
         }
+    }
+
+    /// Returns true if the fid had not yet been seen with this client, so the
+    /// entry counts toward the backfill memory budget like a set insert.
+    fn add_client_action(&mut self, fid: u64, client: u64, bit: u16) -> bool {
+        self.client_messages
+            .entry(client)
+            .or_insert([0; action::COUNT])[action::index(bit)] += 1;
+        let mask = self
+            .clients
+            .entry(fid)
+            .or_default()
+            .entry(client)
+            .or_insert(0);
+        let new = *mask == 0;
+        *mask |= bit;
+        new
     }
 
     /// Returns true if the fid was not already present, so the caller can keep
@@ -349,6 +671,100 @@ pub struct DailyStatsRow {
     /// days without distinction it reads as organic growth toward the present.
     /// Render these differently.
     pub reconstructed: bool,
+    /// Per-client breakdown. Present only when requested, and only for days
+    /// client attribution covers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clients: Option<ClientDayStats>,
+}
+
+/// One day's activity split by client (the fid that requested each signer).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ClientDayStats {
+    /// Attribution started partway through this day, so it undercounts.
+    pub partial: bool,
+    /// Fids with at least one attributed action.
+    pub active_fids: u64,
+    /// Fids by how many distinct clients they used. Counts real clients, before
+    /// apps outside the top N fold into `other`.
+    pub clients_per_fid: ClientsPerFid,
+    /// One entry per shown client, in the same order on every day of a query.
+    pub by_client: Vec<ClientStats>,
+    /// Client sets of the fids that used more than one client, most common
+    /// first. `["other"]` alone means two or more apps outside the top N.
+    pub combinations: Vec<ClientCombination>,
+    pub action_splits: ActionSplits,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct ClientsPerFid {
+    pub one: u64,
+    pub two: u64,
+    pub three: u64,
+    pub four_or_more: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ClientStats {
+    /// App fid as a decimal string, or `self`, `other` or `unresolved`.
+    pub client: String,
+    pub active_fids: u64,
+    /// Fids that used no other client that day.
+    pub exclusive_fids: u64,
+    /// Fids that took each action with this client.
+    pub fids_by_action: BTreeMap<&'static str, u64>,
+    pub messages_by_action: BTreeMap<&'static str, u64>,
+    pub retention: ClientRetention,
+}
+
+/// A window is `null` when it reaches back before attribution started.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct ClientRetention {
+    pub d7: Option<ClientRetentionWindow>,
+    pub d20: Option<ClientRetentionWindow>,
+    pub d30: Option<ClientRetentionWindow>,
+}
+
+/// One client compared with exactly N days earlier, the same anchor as the
+/// top-level `retention`. Fids active on only one of the two days are in none
+/// of these.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct ClientRetentionWindow {
+    /// Used this client on both days.
+    pub retained: u64,
+    /// Used only this client, on both days.
+    pub retained_exclusive: u64,
+    /// Uses this client now; N days earlier was active only on other clients.
+    pub gained_from_other_clients: u64,
+    /// Used this client N days earlier; now active only on other clients.
+    pub lost_to_other_clients: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ClientCombination {
+    pub clients: Vec<String>,
+    pub fids: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ActionSplits {
+    /// Fids that used more than one client.
+    pub multi_client_fids: u64,
+    /// Of those, fids that took different actions on different clients.
+    pub split_fids: u64,
+    /// What multi-client fids did on each client, most common first.
+    pub top_patterns: Vec<ActionPattern>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ActionPattern {
+    pub clients: Vec<ClientActions>,
+    pub fids: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ClientActions {
+    pub client: String,
+    pub actions: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -507,6 +923,14 @@ pub struct DailyStatsIndexer {
     live_from_day: std::sync::atomic::AtomicU32,
     checkpoint: AtomicU64,
     days_written: AtomicU64,
+    /// Resolves signers to clients. `None` turns attribution off.
+    signer_lookup: Option<Arc<dyn SignerRequesterLookup>>,
+    /// Resolved `(fid, signer) -> client code`. A key's requester is fixed when
+    /// the key is added, so entries never go stale; the map is cleared rather
+    /// than evicted when it fills.
+    signer_clients: Mutex<HashMap<(u64, [u8; 32]), u64>>,
+    /// First attributed day; 0 when attribution has never run.
+    clients_from_day: AtomicU32,
 }
 
 impl DailyStatsIndexer {
@@ -517,6 +941,7 @@ impl DailyStatsIndexer {
 
         let checkpoint = Self::load_checkpoint(&db).unwrap_or(0);
         let live_from = Self::load_live_from(&db).unwrap_or(0);
+        let clients_from = Self::load_day(&db, &Self::clients_from_key()).unwrap_or(0);
         Self {
             config,
             db,
@@ -530,7 +955,80 @@ impl DailyStatsIndexer {
             live_from_day: std::sync::atomic::AtomicU32::new(live_from),
             checkpoint: AtomicU64::new(checkpoint),
             days_written: AtomicU64::new(0),
+            signer_lookup: None,
+            signer_clients: Mutex::new(HashMap::new()),
+            clients_from_day: AtomicU32::new(clients_from),
         }
+    }
+
+    /// Attribute messages to clients from now on.
+    ///
+    /// The first start with a lookup records today as the first attributed
+    /// day; later starts keep the recorded day.
+    pub fn with_signer_lookup(mut self, lookup: Arc<dyn SignerRequesterLookup>) -> Self {
+        if self.clients_from_day.load(Ordering::Relaxed) == 0 {
+            self.set_clients_from_day(today());
+        }
+        self.signer_lookup = Some(lookup);
+        self
+    }
+
+    fn set_clients_from_day(&self, day: u32) {
+        self.clients_from_day.store(day, Ordering::Relaxed);
+        let mut txn = RocksDbTransactionBatch::new();
+        txn.put(Self::clients_from_key(), day.to_be_bytes().to_vec());
+        let _ = self.db.commit(txn);
+    }
+
+    /// First day with client data, if attribution has ever run.
+    pub fn clients_from_day(&self) -> Option<u32> {
+        match self.clients_from_day.load(Ordering::Relaxed) {
+            0 => None,
+            day => Some(day),
+        }
+    }
+
+    /// `(client code, action bit)` for a message, or `None` when it is not
+    /// attributed: attribution is off, the message predates it, or it is not a
+    /// client action.
+    fn attribute(&self, shard_id: u32, message: &Message) -> Option<(u64, u16)> {
+        let lookup = self.signer_lookup.as_ref()?;
+        let data = message.data.as_ref()?;
+        let from = self.clients_from_day.load(Ordering::Relaxed);
+        if from == 0 || day_from_farcaster_seconds(data.timestamp as u64) < from {
+            return None;
+        }
+        let bit = action::of(data)?;
+        let client = match <[u8; 32]>::try_from(message.signer.as_slice()) {
+            Ok(signer) => self.resolve_client(lookup.as_ref(), shard_id, data.fid, signer),
+            Err(_) => Client::Unresolved,
+        };
+        Some((client.code(), bit))
+    }
+
+    fn resolve_client(
+        &self,
+        lookup: &dyn SignerRequesterLookup,
+        shard_id: u32,
+        fid: u64,
+        signer: [u8; 32],
+    ) -> Client {
+        if let Some(&code) = self.signer_clients.lock().unwrap().get(&(fid, signer)) {
+            return Client::from_code(code);
+        }
+        let client = match lookup.requester_fid(shard_id, fid, &signer) {
+            Some(requester) if requester == fid => Client::SelfSigned,
+            Some(requester) => Client::App(requester),
+            // Not cached: a miss can be a lookup racing a key change, and the
+            // next message from this key may resolve.
+            None => return Client::Unresolved,
+        };
+        let mut cache = self.signer_clients.lock().unwrap();
+        if cache.len() >= SIGNER_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert((fid, signer), client.code());
+        client
     }
 
     /// Switch between live and backfill flushing strategies.
@@ -596,6 +1094,26 @@ impl DailyStatsIndexer {
         k.push(kind);
         k.extend_from_slice(&day.to_be_bytes());
         k
+    }
+
+    fn client_profile_key(day: u32) -> Vec<u8> {
+        let mut k = Vec::with_capacity(6);
+        k.push(keys::DAILY_STATS_PREFIX);
+        k.push(keys::CLIENT_PROFILE);
+        k.extend_from_slice(&day.to_be_bytes());
+        k
+    }
+
+    fn client_counters_key(day: u32) -> Vec<u8> {
+        let mut k = Vec::with_capacity(6);
+        k.push(keys::DAILY_STATS_PREFIX);
+        k.push(keys::CLIENT_COUNTERS);
+        k.extend_from_slice(&day.to_be_bytes());
+        k
+    }
+
+    fn clients_from_key() -> Vec<u8> {
+        vec![keys::DAILY_STATS_PREFIX, keys::CLIENTS_FROM]
     }
 
     fn checkpoint_key() -> Vec<u8> {
@@ -681,7 +1199,11 @@ impl DailyStatsIndexer {
     }
 
     fn load_live_from(db: &RocksDB) -> Option<u32> {
-        let bytes = db.get(&Self::live_from_key()).ok()??;
+        Self::load_day(db, &Self::live_from_key())
+    }
+
+    fn load_day(db: &RocksDB, key: &[u8]) -> Option<u32> {
+        let bytes = db.get(key).ok()??;
         bytes.try_into().ok().map(u32::from_be_bytes)
     }
 
@@ -708,11 +1230,31 @@ impl DailyStatsIndexer {
         }
     }
 
+    fn read_client_profile(&self, day: u32) -> client_profile::Profile {
+        match self.db.get(&Self::client_profile_key(day)) {
+            Ok(Some(bytes)) => client_profile::decode(&bytes),
+            _ => client_profile::Profile::new(),
+        }
+    }
+
+    fn read_client_counters(&self, day: u32) -> ClientDayCounters {
+        match self.db.get(&Self::client_counters_key(day)) {
+            Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            _ => ClientDayCounters::default(),
+        }
+    }
+
     // --- folding ---
 
     /// Fold one message into `pending`, returning how many fid-set entries it
-    /// newly created (for the backfill memory budget).
-    fn fold_message(&self, message: &Message, pending: &mut BTreeMap<u32, DayAccumulator>) -> u64 {
+    /// newly created (for the backfill memory budget). `attribution` comes from
+    /// [`Self::attribute`], resolved before `pending` was locked.
+    fn fold_message(
+        &self,
+        message: &Message,
+        attribution: Option<(u64, u16)>,
+        pending: &mut BTreeMap<u32, DayAccumulator>,
+    ) -> u64 {
         let Some(data) = message.data.as_ref() else {
             return 0;
         };
@@ -721,10 +1263,14 @@ impl DailyStatsIndexer {
         let acc = pending.entry(day).or_insert_with(DayAccumulator::new);
         let mut new_fids = 0u64;
 
+        if let Some((client, bit)) = attribution {
+            new_fids += acc.add_client_action(fid, client, bit) as u64;
+        }
+
         match MessageType::try_from(data.r#type).ok() {
             Some(MessageType::CastAdd) => {
                 let Some(Body::CastAddBody(body)) = data.body.as_ref() else {
-                    return 0;
+                    return new_fids;
                 };
                 acc.counters.casts += 1;
                 new_fids += acc.add_fid(SetKind::CastAuthors, fid) as u64;
@@ -745,7 +1291,7 @@ impl DailyStatsIndexer {
             }
             Some(MessageType::ReactionAdd) => {
                 let Some(Body::ReactionBody(body)) = data.body.as_ref() else {
-                    return 0;
+                    return new_fids;
                 };
                 acc.counters.reactions += 1;
                 new_fids += acc.add_fid(SetKind::ReactionActors, fid) as u64;
@@ -758,7 +1304,7 @@ impl DailyStatsIndexer {
             }
             Some(MessageType::LinkAdd) => {
                 let Some(Body::LinkBody(body)) = data.body.as_ref() else {
-                    return 0;
+                    return new_fids;
                 };
                 // Deliberately not filtered to `type == "follow"`: the Dune
                 // links dataset this replaces counted every link type, and
@@ -955,6 +1501,39 @@ impl DailyStatsIndexer {
                 }
                 txn.put(Self::hll_key(kind, day), regs);
             }
+
+            if !acc.clients.is_empty() {
+                // Masks union and message counts add, so a fid seen on one
+                // client in this flush and another in the next ends up with both.
+                let mut profile = self.read_client_profile(day);
+                for (fid, clients) in acc.clients {
+                    let merged = profile.entry(fid).or_default();
+                    for (client, mask) in clients {
+                        *merged.entry(client).or_insert(0) |= mask;
+                    }
+                }
+                let mut client_counters = self.read_client_counters(day);
+                for (client, counts) in acc.client_messages {
+                    let row = client_counters.messages.entry(client).or_default();
+                    row.resize(action::COUNT, 0);
+                    for (total, n) in row.iter_mut().zip(counts) {
+                        *total += n;
+                    }
+                }
+                client_counters.active_fids.clear();
+                for clients in profile.values() {
+                    for client in clients.keys() {
+                        *client_counters.active_fids.entry(*client).or_default() += 1;
+                    }
+                }
+                let encoded = serde_json::to_vec(&client_counters)
+                    .map_err(|e| IndexerError::Serialization(e.to_string()))?;
+                txn.put(Self::client_counters_key(day), encoded);
+                txn.put(
+                    Self::client_profile_key(day),
+                    client_profile::encode(&profile),
+                );
+            }
         }
 
         self.db
@@ -1009,6 +1588,19 @@ impl DailyStatsIndexer {
     /// than gaps, so the moving average and the chart's x-axis both stay on real
     /// calendar days.
     pub fn range(&self, from_day: u32, to_day: u32) -> Result<Vec<DailyStatsRow>, IndexerError> {
+        self.range_with_clients(from_day, to_day, None)
+    }
+
+    /// [`Self::range`], plus a per-client breakdown on each attributed day when
+    /// `top_clients` is set: `self`, the `top_clients` app fids with the most
+    /// fid-days across the range, `other`, and `unresolved`. Ranking over the
+    /// whole range keeps the same clients on every day, so each is a series.
+    pub fn range_with_clients(
+        &self,
+        from_day: u32,
+        to_day: u32,
+        top_clients: Option<usize>,
+    ) -> Result<Vec<DailyStatsRow>, IndexerError> {
         if to_day < from_day {
             return Err(IndexerError::InvalidData(
                 "`to` must not precede `from`".to_string(),
@@ -1114,11 +1706,300 @@ impl DailyStatsIndexer {
                     d30: retained(30),
                 },
                 reconstructed: live_from != 0 && day < live_from,
+                clients: None,
             });
+        }
+
+        if let Some(top) = top_clients {
+            let mut series = self.client_series(from_day, to_day, top.min(MAX_TOP_CLIENTS));
+            for (day, row) in (from_day..=to_day).zip(rows.iter_mut()) {
+                row.clients = series.remove(&day);
+            }
         }
 
         Ok(rows)
     }
+
+    /// Client breakdown for every attributed day in `[from_day, to_day]`.
+    fn client_series(
+        &self,
+        from_day: u32,
+        to_day: u32,
+        top: usize,
+    ) -> BTreeMap<u32, ClientDayStats> {
+        let mut out = BTreeMap::new();
+        let tracked_from = self.clients_from_day.load(Ordering::Relaxed);
+        if tracked_from == 0 || to_day < tracked_from {
+            return out;
+        }
+        let first = from_day.max(tracked_from);
+
+        let counters: BTreeMap<u32, ClientDayCounters> = (first..=to_day)
+            .map(|day| (day, self.read_client_counters(day)))
+            .collect();
+        let mut fid_days: HashMap<u64, u64> = HashMap::new();
+        for day_counters in counters.values() {
+            for (&code, &n) in &day_counters.active_fids {
+                if matches!(Client::from_code(code), Client::App(_)) {
+                    *fid_days.entry(code).or_default() += n;
+                }
+            }
+        }
+        let ranked = most_common(fid_days, top);
+        let labels = ClientLabels::new(ranked.iter().map(|(code, _)| *code));
+
+        // Same rolling-window walk as the top-level retention: start 30 days
+        // early (but not before attribution) and keep at most 31 days decoded.
+        const WINDOWS: [u32; 3] = [7, 20, 30];
+        let walk_from = first.saturating_sub(30).max(tracked_from);
+        let mut days: BTreeMap<u32, BTreeMap<u64, FidClients>> = BTreeMap::new();
+        for day in walk_from..=to_day {
+            days.insert(day, self.labeled_day(day, &labels));
+            while let Some((&oldest, _)) = days.iter().next() {
+                if day - oldest > 30 {
+                    days.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            if day < first {
+                continue;
+            }
+            let past = WINDOWS.map(|n| {
+                day.checked_sub(n)
+                    .filter(|past_day| *past_day >= tracked_from)
+                    .and_then(|past_day| days.get(&past_day))
+            });
+            out.insert(
+                day,
+                client_day_stats(
+                    &days[&day],
+                    past,
+                    &counters[&day],
+                    &labels,
+                    day == tracked_from,
+                ),
+            );
+        }
+        out
+    }
+
+    /// `day`'s client profile, with each client mapped to its shown label.
+    fn labeled_day(&self, day: u32, labels: &ClientLabels) -> BTreeMap<u64, FidClients> {
+        self.read_client_profile(day)
+            .into_iter()
+            .map(|(fid, clients)| {
+                let first_mask = clients.values().next().copied();
+                let split = clients.values().any(|mask| Some(*mask) != first_mask);
+                let mut by_label: BTreeMap<usize, u16> = BTreeMap::new();
+                for (&code, &mask) in &clients {
+                    *by_label.entry(labels.of(code)).or_insert(0) |= mask;
+                }
+                (
+                    fid,
+                    FidClients {
+                        clients: clients.len(),
+                        split,
+                        labels: by_label,
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+/// One fid's day, as a client breakdown query sees it.
+struct FidClients {
+    /// Distinct real clients, before apps outside the top N fold into `other`.
+    clients: usize,
+    /// Took different actions on different real clients.
+    split: bool,
+    /// Shown label -> action mask.
+    labels: BTreeMap<usize, u16>,
+}
+
+/// The clients one query shows, in output order: `self`, the ranked app fids,
+/// `other`, `unresolved`.
+struct ClientLabels {
+    names: Vec<String>,
+    by_code: HashMap<u64, usize>,
+    other: usize,
+}
+
+impl ClientLabels {
+    fn new(apps: impl Iterator<Item = u64>) -> Self {
+        let mut names = vec!["self".to_string()];
+        let mut by_code = HashMap::from([(Client::SelfSigned.code(), 0)]);
+        for code in apps {
+            if let Client::App(fid) = Client::from_code(code) {
+                by_code.insert(code, names.len());
+                names.push(fid.to_string());
+            }
+        }
+        let other = names.len();
+        names.push("other".to_string());
+        by_code.insert(Client::Unresolved.code(), names.len());
+        names.push("unresolved".to_string());
+        Self {
+            names,
+            by_code,
+            other,
+        }
+    }
+
+    fn of(&self, code: u64) -> usize {
+        self.by_code.get(&code).copied().unwrap_or(self.other)
+    }
+}
+
+/// The `limit` largest counts, ties broken by key so output is stable.
+fn most_common<K: Ord>(counts: HashMap<K, u64>, limit: usize) -> Vec<(K, u64)> {
+    let mut sorted: Vec<(K, u64)> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    sorted.truncate(limit);
+    sorted
+}
+
+fn by_action_name(counts: &[u64; action::COUNT]) -> BTreeMap<&'static str, u64> {
+    action::NAMES
+        .iter()
+        .copied()
+        .zip(counts.iter().copied())
+        .collect()
+}
+
+/// One day's breakdown. `past` holds the days exactly 7, 20 and 30 days
+/// earlier, `None` where that day predates attribution.
+fn client_day_stats(
+    today: &BTreeMap<u64, FidClients>,
+    past: [Option<&BTreeMap<u64, FidClients>>; 3],
+    counters: &ClientDayCounters,
+    labels: &ClientLabels,
+    partial: bool,
+) -> ClientDayStats {
+    let n = labels.names.len();
+    let mut active = vec![0u64; n];
+    let mut exclusive = vec![0u64; n];
+    let mut fids_by_action = vec![[0u64; action::COUNT]; n];
+    let mut clients_per_fid = ClientsPerFid::default();
+    let mut combinations: HashMap<Vec<usize>, u64> = HashMap::new();
+    let mut patterns: HashMap<Vec<(usize, u16)>, u64> = HashMap::new();
+    let (mut multi_client_fids, mut split_fids) = (0u64, 0u64);
+
+    for fid in today.values() {
+        match fid.clients {
+            0 => {}
+            1 => clients_per_fid.one += 1,
+            2 => clients_per_fid.two += 1,
+            3 => clients_per_fid.three += 1,
+            _ => clients_per_fid.four_or_more += 1,
+        }
+        for (&label, &mask) in &fid.labels {
+            active[label] += 1;
+            if fid.clients == 1 {
+                exclusive[label] += 1;
+            }
+            for (i, slot) in fids_by_action[label].iter_mut().enumerate() {
+                if mask & (1 << i) != 0 {
+                    *slot += 1;
+                }
+            }
+        }
+        if fid.clients >= 2 {
+            multi_client_fids += 1;
+            split_fids += fid.split as u64;
+            *combinations
+                .entry(fid.labels.keys().copied().collect())
+                .or_default() += 1;
+            *patterns
+                .entry(fid.labels.iter().map(|(l, m)| (*l, *m)).collect())
+                .or_default() += 1;
+        }
+    }
+
+    let mut messages = vec![[0u64; action::COUNT]; n];
+    for (&code, counts) in &counters.messages {
+        for (total, c) in messages[labels.of(code)].iter_mut().zip(counts) {
+            *total += c;
+        }
+    }
+
+    let windows = past.map(|p| p.map(|p| client_retention(today, p, n)));
+    let by_client = (0..n)
+        .map(|label| ClientStats {
+            client: labels.names[label].clone(),
+            active_fids: active[label],
+            exclusive_fids: exclusive[label],
+            fids_by_action: by_action_name(&fids_by_action[label]),
+            messages_by_action: by_action_name(&messages[label]),
+            retention: ClientRetention {
+                d7: windows[0].as_ref().map(|w| w[label].clone()),
+                d20: windows[1].as_ref().map(|w| w[label].clone()),
+                d30: windows[2].as_ref().map(|w| w[label].clone()),
+            },
+        })
+        .collect();
+
+    ClientDayStats {
+        partial,
+        active_fids: today.len() as u64,
+        clients_per_fid,
+        by_client,
+        combinations: most_common(combinations, TOP_GROUPS)
+            .into_iter()
+            .map(|(set, fids)| ClientCombination {
+                clients: set.iter().map(|l| labels.names[*l].clone()).collect(),
+                fids,
+            })
+            .collect(),
+        action_splits: ActionSplits {
+            multi_client_fids,
+            split_fids,
+            top_patterns: most_common(patterns, TOP_GROUPS)
+                .into_iter()
+                .map(|(pattern, fids)| ActionPattern {
+                    clients: pattern
+                        .iter()
+                        .map(|(label, mask)| ClientActions {
+                            client: labels.names[*label].clone(),
+                            actions: action::names(*mask),
+                        })
+                        .collect(),
+                    fids,
+                })
+                .collect(),
+        },
+    }
+}
+
+/// Per-label movement between `past` and `today`, indexed by label.
+fn client_retention(
+    today: &BTreeMap<u64, FidClients>,
+    past: &BTreeMap<u64, FidClients>,
+    n: usize,
+) -> Vec<ClientRetentionWindow> {
+    let mut windows = vec![ClientRetentionWindow::default(); n];
+    for (fid, now) in today {
+        let Some(then) = past.get(fid) else {
+            continue;
+        };
+        for &label in now.labels.keys() {
+            if then.labels.contains_key(&label) {
+                windows[label].retained += 1;
+                if now.clients == 1 && then.clients == 1 {
+                    windows[label].retained_exclusive += 1;
+                }
+            } else {
+                windows[label].gained_from_other_clients += 1;
+            }
+        }
+        for &label in then.labels.keys() {
+            if !now.labels.contains_key(&label) {
+                windows[label].lost_to_other_clients += 1;
+            }
+        }
+    }
+    windows
 }
 
 #[async_trait]
@@ -1138,12 +2019,14 @@ impl Indexer for DailyStatsIndexer {
             // a historical day every time storage limits bite.
             IndexEvent::MessageCommitted {
                 message,
+                shard_id,
                 kind: MessageEventKind::Merge,
                 ..
             } => {
+                let attribution = self.attribute(*shard_id, message);
                 let new_fids = {
                     let mut pending = self.pending.lock().unwrap();
-                    self.fold_message(message, &mut pending)
+                    self.fold_message(message, attribution, &mut pending)
                 };
                 self.pending_fids.fetch_add(new_fids, Ordering::Relaxed);
                 self.pending_events.fetch_add(1, Ordering::Relaxed);
@@ -1153,14 +2036,19 @@ impl Indexer for DailyStatsIndexer {
             }
             IndexEvent::MessagesCommitted {
                 messages,
+                shard_id,
                 kind: MessageEventKind::Merge,
                 ..
             } => {
+                let attributions: Vec<_> = messages
+                    .iter()
+                    .map(|m| self.attribute(*shard_id, m))
+                    .collect();
                 let new_fids = {
                     let mut pending = self.pending.lock().unwrap();
                     let mut n = 0u64;
-                    for message in messages {
-                        n += self.fold_message(message, &mut pending);
+                    for (message, attribution) in messages.iter().zip(attributions) {
+                        n += self.fold_message(message, attribution, &mut pending);
                     }
                     n
                 };
@@ -1181,32 +2069,32 @@ impl Indexer for DailyStatsIndexer {
     }
 
     async fn process_batch(&self, events: &[IndexEvent]) -> Result<(), IndexerError> {
+        // Resolve signers before taking the accumulator lock: a cache miss is a
+        // RocksDB read, and the live path folds under the same lock.
+        let mut merged: Vec<(&Message, Option<(u64, u16)>)> = Vec::new();
+        for event in events {
+            match event {
+                IndexEvent::MessageCommitted {
+                    message,
+                    shard_id,
+                    kind: MessageEventKind::Merge,
+                    ..
+                } => merged.push((message, self.attribute(*shard_id, message))),
+                IndexEvent::MessagesCommitted {
+                    messages,
+                    shard_id,
+                    kind: MessageEventKind::Merge,
+                    ..
+                } => merged.extend(messages.iter().map(|m| (m, self.attribute(*shard_id, m)))),
+                _ => {}
+            }
+        }
         {
             let mut pending = self.pending.lock().unwrap();
-            let mut folded = 0u64;
+            let folded = merged.len() as u64;
             let mut new_fids = 0u64;
-            for event in events {
-                match event {
-                    IndexEvent::MessageCommitted {
-                        message,
-                        kind: MessageEventKind::Merge,
-                        ..
-                    } => {
-                        new_fids += self.fold_message(message, &mut pending);
-                        folded += 1;
-                    }
-                    IndexEvent::MessagesCommitted {
-                        messages,
-                        kind: MessageEventKind::Merge,
-                        ..
-                    } => {
-                        for message in messages {
-                            new_fids += self.fold_message(message, &mut pending);
-                        }
-                        folded += messages.len() as u64;
-                    }
-                    _ => {}
-                }
+            for (message, attribution) in merged {
+                new_fids += self.fold_message(message, attribution, &mut pending);
             }
             self.pending_events.fetch_add(folded, Ordering::Relaxed);
             self.messages_folded.fetch_add(folded, Ordering::Relaxed);
@@ -1902,5 +2790,514 @@ mod tests {
         assert!(idx.range(d, d - 1).is_err());
         assert!(idx.range(d, d + MAX_RANGE_DAYS).is_err());
         assert!(idx.range(d, d + MAX_RANGE_DAYS - 1).is_ok());
+    }
+
+    // --- client attribution ---
+
+    /// Reads the requester straight out of a [`key_from`] signer; any other
+    /// key is unknown.
+    struct KeyEncodesRequester;
+
+    impl SignerRequesterLookup for KeyEncodesRequester {
+        fn requester_fid(&self, _shard_id: u32, _fid: u64, signer: &[u8]) -> Option<u64> {
+            if signer.len() != 32 || signer[8..] != [0xAB; 24] {
+                return None;
+            }
+            Some(u64::from_be_bytes(signer[..8].try_into().unwrap()))
+        }
+    }
+
+    /// A signer that `requester` requested.
+    fn key_from(requester: u64) -> Vec<u8> {
+        let mut key = vec![0xAB; 32];
+        key[..8].copy_from_slice(&requester.to_be_bytes());
+        key
+    }
+
+    /// `message`, signed with a key `requester` requested.
+    fn via(requester: u64, mut message: Message) -> Message {
+        message.signer = key_from(requester);
+        message
+    }
+
+    /// `message`, signed with a key neither store knows.
+    fn via_unknown_key(mut message: Message) -> Message {
+        message.signer = vec![0x01; 32];
+        message
+    }
+
+    /// An indexer that attributes messages from `from_day` on.
+    fn attributing(db: Arc<RocksDB>, from_day: u32) -> DailyStatsIndexer {
+        let idx = indexer(db).with_signer_lookup(Arc::new(KeyEncodesRequester));
+        idx.set_clients_from_day(from_day);
+        idx
+    }
+
+    fn reacted(fid: u64, day: u32, kind: crate::proto::ReactionType) -> Message {
+        let mut m = reaction(fid, day, 99, vec![0xcc; 20]);
+        if let Some(Body::ReactionBody(body)) = m.data.as_mut().and_then(|d| d.body.as_mut()) {
+            body.r#type = kind as i32;
+        }
+        m
+    }
+
+    fn like(fid: u64, day: u32) -> Message {
+        reacted(fid, day, crate::proto::ReactionType::Like)
+    }
+
+    fn reply(fid: u64, day: u32) -> Message {
+        cast(
+            fid,
+            day,
+            Some(crate::proto::cast_add_body::Parent::ParentCastId(CastId {
+                fid: 9,
+                hash: vec![0xaa; 20],
+            })),
+        )
+    }
+
+    /// A message of `r#type` with no body, for types the actions classify by
+    /// type alone.
+    fn bare(fid: u64, day: u32, r#type: MessageType) -> Message {
+        Message {
+            data: Some(MessageData {
+                fid,
+                timestamp: ts_on_day(day),
+                r#type: r#type as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn client<'a>(stats: &'a ClientDayStats, name: &str) -> &'a ClientStats {
+        stats
+            .by_client
+            .iter()
+            .find(|c| c.client == name)
+            .unwrap_or_else(|| panic!("no client {:?} in {:?}", name, stats.by_client))
+    }
+
+    fn clients_on(idx: &DailyStatsIndexer, day: u32, top: usize) -> ClientDayStats {
+        idx.range_with_clients(day, day, Some(top)).unwrap()[0]
+            .clients
+            .clone()
+            .expect("day is attributed")
+    }
+
+    #[test]
+    fn client_profile_roundtrips() {
+        let mut p = client_profile::Profile::new();
+        p.entry(3)
+            .or_default()
+            .insert(Client::SelfSigned.code(), action::CAST | action::LIKE);
+        p.entry(3)
+            .or_default()
+            .insert(Client::App(9152).code(), action::LIKE);
+        p.entry(1_500_000)
+            .or_default()
+            .insert(Client::Unresolved.code(), action::PROFILE);
+        let bytes = client_profile::encode(&p);
+        assert_eq!(client_profile::decode(&bytes), p);
+        assert!(client_profile::decode(&[]).is_empty());
+
+        // Damage after the first fid loses the tail, not the day.
+        let first: client_profile::Profile =
+            p.iter().take(1).map(|(k, v)| (*k, v.clone())).collect();
+        let first_len = client_profile::encode(&first).len();
+        assert_eq!(client_profile::decode(&bytes[..first_len + 1]), first);
+
+        for client in [
+            Client::SelfSigned,
+            Client::Unresolved,
+            Client::App(0),
+            Client::App(9152),
+        ] {
+            assert_eq!(Client::from_code(client.code()), client);
+        }
+    }
+
+    #[test]
+    fn classifies_client_actions() {
+        let d = date_string_to_day("2026-08-01").unwrap();
+        let of = |m: Message| action::of(m.data.as_ref().unwrap());
+        assert_eq!(of(cast(1, d, None)), Some(action::CAST));
+        assert_eq!(
+            of(cast(
+                1,
+                d,
+                Some(crate::proto::cast_add_body::Parent::ParentUrl(
+                    "https://example.com".to_string()
+                ))
+            )),
+            Some(action::CAST),
+            "a channel cast is still top-level"
+        );
+        assert_eq!(of(reply(1, d)), Some(action::REPLY));
+        assert_eq!(of(like(1, d)), Some(action::LIKE));
+        assert_eq!(
+            of(reacted(1, d, crate::proto::ReactionType::Recast)),
+            Some(action::RECAST)
+        );
+        assert_eq!(of(link(1, d, 2)), Some(action::LINK));
+        for t in [
+            MessageType::CastRemove,
+            MessageType::ReactionRemove,
+            MessageType::LinkRemove,
+        ] {
+            assert_eq!(of(bare(1, d, t)), Some(action::DELETE), "{:?}", t);
+        }
+        assert_eq!(
+            of(bare(1, d, MessageType::UserDataAdd)),
+            Some(action::PROFILE)
+        );
+        assert_eq!(
+            of(bare(1, d, MessageType::VerificationAddEthAddress)),
+            Some(action::VERIFICATION)
+        );
+        // Custody-signed and invalid messages are not client activity.
+        assert_eq!(of(bare(1, d, MessageType::KeyAdd)), None);
+        assert_eq!(of(bare(1, d, MessageType::UsernameProof)), None);
+        assert_eq!(
+            of(reaction(1, d, 2, vec![0xbb; 20])),
+            None,
+            "REACTION_TYPE_NONE"
+        );
+
+        assert_eq!(
+            action::names(action::CAST | action::LIKE),
+            vec!["cast", "like"]
+        );
+    }
+
+    #[tokio::test]
+    async fn attributes_to_app_fid_self_or_unresolved() {
+        let d = date_string_to_day("2026-08-01").unwrap();
+        let idx = attributing(make_test_db(), d);
+        ingest(
+            &idx,
+            vec![
+                via(9152, cast(10, d, None)),
+                // fid 11 signing with a key it requested itself.
+                via(11, cast(11, d, None)),
+                via_unknown_key(cast(12, d, None)),
+            ],
+        )
+        .await;
+
+        let stats = clients_on(&idx, d, 10);
+        assert!(stats.partial, "attribution started on this day");
+        assert_eq!(stats.active_fids, 3);
+        let names: Vec<&str> = stats.by_client.iter().map(|c| c.client.as_str()).collect();
+        assert_eq!(names, ["self", "9152", "other", "unresolved"]);
+        assert_eq!(client(&stats, "self").active_fids, 1);
+        assert_eq!(client(&stats, "9152").active_fids, 1);
+        assert_eq!(client(&stats, "9152").messages_by_action["cast"], 1);
+        assert_eq!(client(&stats, "unresolved").active_fids, 1);
+        assert_eq!(client(&stats, "other").active_fids, 0);
+    }
+
+    #[tokio::test]
+    async fn breakdown_is_opt_in_and_starts_at_attribution() {
+        let d = date_string_to_day("2026-08-01").unwrap();
+        let idx = attributing(make_test_db(), d);
+        ingest(
+            &idx,
+            vec![via(9152, cast(1, d - 1, None)), via(9152, cast(1, d, None))],
+        )
+        .await;
+
+        let rows = idx.range_with_clients(d - 1, d, Some(5)).unwrap();
+        // The day before attribution still counts in the top-level series...
+        assert_eq!(rows[0].casts.total, 1);
+        // ...but has no client data, and its message was not attributed.
+        assert_eq!(rows[0].clients, None);
+        let stats = rows[1].clients.as_ref().unwrap();
+        assert_eq!(client(stats, "9152").messages_by_action["cast"], 1);
+
+        // Without `clients`, the row shape is unchanged.
+        let rows = idx.range(d, d).unwrap();
+        assert_eq!(rows[0].clients, None);
+        let json = serde_json::to_string(&rows[0]).unwrap();
+        assert!(!json.contains("\"clients\""), "{}", json);
+    }
+
+    #[tokio::test]
+    async fn attribution_start_survives_restart() {
+        let db = make_test_db();
+        let d = date_string_to_day("2026-08-01").unwrap();
+        drop(attributing(db.clone(), d));
+        let again = indexer(db).with_signer_lookup(Arc::new(KeyEncodesRequester));
+        assert_eq!(again.clients_from_day(), Some(d));
+
+        let fresh = indexer(make_test_db());
+        assert_eq!(fresh.clients_from_day(), None);
+        let fresh = fresh.with_signer_lookup(Arc::new(KeyEncodesRequester));
+        assert_eq!(fresh.clients_from_day(), Some(today()));
+    }
+
+    #[tokio::test]
+    async fn counts_exclusive_use_and_client_combinations() {
+        let d = date_string_to_day("2026-08-01").unwrap();
+        let idx = attributing(make_test_db(), d);
+        ingest(
+            &idx,
+            vec![
+                via(100, cast(1, d, None)),
+                via(100, like(1, d)),
+                via(100, cast(2, d, None)),
+                via(2, like(2, d)),
+                via(100, cast(3, d, None)),
+                via(200, cast(3, d, None)),
+                via(100, cast(4, d, None)),
+                via(200, cast(4, d, None)),
+                via(4, cast(4, d, None)),
+            ],
+        )
+        .await;
+
+        let stats = clients_on(&idx, d, 10);
+        assert_eq!(
+            stats.clients_per_fid,
+            ClientsPerFid {
+                one: 1,
+                two: 2,
+                three: 1,
+                four_or_more: 0
+            }
+        );
+        assert_eq!(client(&stats, "100").active_fids, 4);
+        assert_eq!(client(&stats, "100").exclusive_fids, 1);
+        assert_eq!(client(&stats, "self").active_fids, 2);
+        assert_eq!(client(&stats, "self").exclusive_fids, 0);
+        assert_eq!(client(&stats, "200").active_fids, 2);
+
+        let combos: Vec<(Vec<&str>, u64)> = stats
+            .combinations
+            .iter()
+            .map(|c| (c.clients.iter().map(|s| s.as_str()).collect(), c.fids))
+            .collect();
+        assert_eq!(
+            combos,
+            vec![
+                (vec!["self", "100"], 1),
+                (vec!["self", "100", "200"], 1),
+                (vec!["100", "200"], 1),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn finds_fids_that_do_different_things_on_different_clients() {
+        let d = date_string_to_day("2026-08-01").unwrap();
+        let idx = attributing(make_test_db(), d);
+        ingest(
+            &idx,
+            vec![
+                // fids 1 and 4: like on app 100, cast and like on their own key.
+                via(100, like(1, d)),
+                via(1, cast(1, d, None)),
+                via(1, like(1, d)),
+                via(100, like(4, d)),
+                via(4, cast(4, d, None)),
+                via(4, like(4, d)),
+                // fid 2: casts on two apps, so two clients but no split.
+                via(100, cast(2, d, None)),
+                via(200, cast(2, d, None)),
+                // fid 3: one client only.
+                via(100, like(3, d)),
+            ],
+        )
+        .await;
+
+        let splits = clients_on(&idx, d, 10).action_splits;
+        assert_eq!(splits.multi_client_fids, 3);
+        assert_eq!(splits.split_fids, 2);
+        let top = &splits.top_patterns[0];
+        assert_eq!(top.fids, 2);
+        assert_eq!(
+            top.clients,
+            vec![
+                ClientActions {
+                    client: "self".to_string(),
+                    actions: vec!["cast", "like"],
+                },
+                ClientActions {
+                    client: "100".to_string(),
+                    actions: vec!["like"],
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn client_retention_tracks_moves_between_clients() {
+        let base = date_string_to_day("2026-08-10").unwrap();
+        let then = base - 7;
+        let idx = attributing(make_test_db(), then);
+        ingest(
+            &idx,
+            vec![
+                via(100, cast(1, then, None)),
+                via(100, cast(2, then, None)),
+                via(200, cast(3, then, None)),
+                via(100, cast(4, then, None)),
+                via(4, cast(4, then, None)),
+                // fid 1 stays on 100, alone both days.
+                via(100, cast(1, base, None)),
+                // fid 2 moves from 100 to 200.
+                via(200, cast(2, base, None)),
+                // fid 3 adds 100 next to 200.
+                via(100, cast(3, base, None)),
+                via(200, cast(3, base, None)),
+                // fid 4 drops 100 and keeps its own key.
+                via(4, cast(4, base, None)),
+                // fid 5 is new: in no retention bucket.
+                via(100, cast(5, base, None)),
+            ],
+        )
+        .await;
+
+        let stats = clients_on(&idx, base, 10);
+        assert!(!stats.partial);
+        let window = |name: &str| client(&stats, name).retention.d7.clone().unwrap();
+        assert_eq!(
+            window("100"),
+            ClientRetentionWindow {
+                retained: 1,
+                retained_exclusive: 1,
+                gained_from_other_clients: 1,
+                lost_to_other_clients: 2,
+            }
+        );
+        assert_eq!(
+            window("200"),
+            ClientRetentionWindow {
+                retained: 1,
+                retained_exclusive: 0,
+                gained_from_other_clients: 1,
+                lost_to_other_clients: 0,
+            }
+        );
+        assert_eq!(
+            window("self"),
+            ClientRetentionWindow {
+                retained: 1,
+                retained_exclusive: 0,
+                gained_from_other_clients: 0,
+                lost_to_other_clients: 0,
+            }
+        );
+        // 20 and 30 days back predate attribution: unknown, not zero.
+        assert_eq!(client(&stats, "100").retention.d20, None);
+        assert_eq!(client(&stats, "100").retention.d30, None);
+    }
+
+    #[tokio::test]
+    async fn apps_outside_the_top_n_fold_into_other() {
+        let d = date_string_to_day("2026-08-01").unwrap();
+        let idx = attributing(make_test_db(), d);
+        ingest(
+            &idx,
+            vec![
+                via(100, cast(1, d, None)),
+                via(100, cast(2, d, None)),
+                via(200, cast(3, d, None)),
+                via(300, cast(4, d, None)),
+                via(400, cast(4, d, None)),
+            ],
+        )
+        .await;
+
+        let stats = clients_on(&idx, d, 1);
+        let names: Vec<&str> = stats.by_client.iter().map(|c| c.client.as_str()).collect();
+        assert_eq!(names, ["self", "100", "other", "unresolved"]);
+        let other = client(&stats, "other");
+        assert_eq!(other.active_fids, 2);
+        // fid 3 used one real client; fid 4 used two that both fold into other.
+        assert_eq!(other.exclusive_fids, 1);
+        assert_eq!(stats.clients_per_fid.two, 1);
+        assert_eq!(stats.combinations.len(), 1);
+        assert_eq!(stats.combinations[0].clients, vec!["other".to_string()]);
+        assert_eq!(other.messages_by_action["cast"], 3);
+    }
+
+    #[test]
+    fn store_lookup_reads_onchain_metadata_then_gasless_records_across_shards() {
+        use crate::proto::SignerEventType;
+        use crate::storage::store::account::{
+            put_gasless_key_record, GaslessKeyRecord, StoreEventHandler,
+        };
+        use crate::utils::factory::{events_factory, signers};
+
+        let shard = |id: u32| {
+            let db = make_test_db();
+            (
+                id,
+                OnchainEventStore::new(db.clone(), StoreEventHandler::new()),
+                db,
+            )
+        };
+        let (one, two) = (shard(1), shard(2));
+
+        // Shard 1: an onchain key for fid 7, with the SignedKeyRequest metadata
+        // of a real mainnet signer requested by fid 9152.
+        let signing_key = signers::generate_signer();
+        let onchain_key = signing_key.verifying_key().as_bytes().to_vec();
+        let mut event =
+            events_factory::create_signer_event(7, signing_key, SignerEventType::Add, None, None);
+        if let Some(on_chain_event::Body::SignerEventBody(body)) = event.body.as_mut() {
+            body.metadata = hex::decode("000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000023c000000000000000000000000002ef790dd7993a35fd847c053eddae940d05559600000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000065420dd50000000000000000000000000000000000000000000000000000000000000041bd0677376b4740f956a6d591e863d948bc2771d5ac109bfa57bd24127c35ca4b3cd00d56593750802eff94cd28e65b32ab06012a4940f0a5b8c25ca1e54050761b00000000000000000000000000000000000000000000000000000000000000").unwrap();
+        }
+        let mut txn = RocksDbTransactionBatch::new();
+        one.1.merge_onchain_event(event, &mut txn).unwrap();
+        one.2.commit(txn).unwrap();
+
+        // Shard 2 only: a gasless key for fid 9, requested by fid 555.
+        let gasless_key = [0xCC; 32];
+        let mut txn = RocksDbTransactionBatch::new();
+        put_gasless_key_record(
+            &two.2,
+            &mut txn,
+            9,
+            &gasless_key,
+            &GaslessKeyRecord {
+                message: None,
+                request_fid: 555,
+            },
+        )
+        .unwrap();
+        two.2.commit(txn).unwrap();
+
+        let lookup = StoreSignerRequesterLookup::from_shards(vec![two, one]);
+        assert_eq!(lookup.requester_fid(1, 7, &onchain_key), Some(9152));
+        // Reported on shard 1, found by falling back to shard 2.
+        assert_eq!(lookup.requester_fid(1, 9, &gasless_key), Some(555));
+        assert_eq!(lookup.requester_fid(1, 7, &[0xEE; 32]), None);
+        assert_eq!(
+            lookup.requester_fid(1, 8, &onchain_key),
+            None,
+            "key belongs to fid 7"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_activity_merges_across_flushes() {
+        let d = date_string_to_day("2026-08-01").unwrap();
+        let idx = attributing(make_test_db(), d);
+        // `ingest` flushes after each call, so these are three separate writes.
+        ingest(&idx, vec![via(100, cast(1, d, None))]).await;
+        ingest(&idx, vec![via(1, like(1, d))]).await;
+        ingest(&idx, vec![via(100, like(1, d))]).await;
+
+        let stats = clients_on(&idx, d, 10);
+        assert_eq!(stats.active_fids, 1);
+        assert_eq!(stats.clients_per_fid.two, 1);
+        let app = client(&stats, "100");
+        assert_eq!(app.fids_by_action["cast"], 1);
+        assert_eq!(app.fids_by_action["like"], 1);
+        assert_eq!(app.messages_by_action["cast"], 1);
+        assert_eq!(app.messages_by_action["like"], 1);
+        assert_eq!(client(&stats, "self").messages_by_action["like"], 1);
     }
 }

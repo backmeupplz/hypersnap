@@ -33,6 +33,7 @@ mod tests {
             StoreOptions {
                 conflict_free: true,
                 save_hub_events: false,
+                ..Default::default()
             },
         );
 
@@ -1684,6 +1685,80 @@ mod tests {
         let hyper_second =
             CastStore::get_cast_add(&hyper_store, FID_FOR_TEST, second.hash.clone()).unwrap();
         assert!(hyper_second.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_casts_by_parent_url_skips_longer_urls_with_the_same_start() {
+        // A channel's casts sit under its URL in the index, right before the
+        // casts of any channel whose URL starts with it (`dev` and `dev-jobs`).
+        let dev = Parent::ParentUrl("https://farcaster.xyz/~/channel/dev".to_string());
+        let dev_jobs = Parent::ParentUrl("https://farcaster.xyz/~/channel/dev-jobs".to_string());
+        let timestamp = time::farcaster_time();
+        let cast = |parent: &Parent, text: &str, offset: u32| {
+            messages_factory::casts::create_cast_add_rich(
+                FID_FOR_TEST,
+                text,
+                Some(CastType::Cast),
+                vec![],
+                Some(parent.clone()),
+                vec![],
+                Some(timestamp + offset),
+                None,
+            )
+        };
+        let mine: Vec<_> = (0..3).map(|i| cast(&dev, "dev", i * 2)).collect();
+        let theirs: Vec<_> = (0..5)
+            .map(|i| cast(&dev_jobs, "dev-jobs", i * 2 + 1))
+            .collect();
+
+        for ctx in [StateContext::Legacy, StateContext::Hyper] {
+            let (store, db, _dir) = create_test_store_with_prune_limit_ctx(100, ctx);
+            merge_messages(&store, &db, mine.iter().chain(theirs.iter()).collect());
+
+            for reverse in [false, true] {
+                let mut expected: Vec<Vec<u8>> = mine.iter().map(|m| m.hash.clone()).collect();
+                if reverse {
+                    expected.reverse();
+                }
+                // one page bigger than the channel, and page by page to the end
+                let all = CastStore::get_casts_by_parent(
+                    &store,
+                    &dev,
+                    &PageOptions {
+                        page_size: Some(50),
+                        page_token: None,
+                        reverse,
+                    },
+                )
+                .unwrap();
+                let got: Vec<Vec<u8>> = all.messages.iter().map(|m| m.hash.clone()).collect();
+                assert_eq!(got, expected, "{:?} reverse={}", ctx, reverse);
+
+                let mut got = vec![];
+                let mut token = None;
+                loop {
+                    let page = CastStore::get_casts_by_parent(
+                        &store,
+                        &dev,
+                        &PageOptions {
+                            page_size: Some(1),
+                            page_token: token,
+                            reverse,
+                        },
+                    )
+                    .unwrap();
+                    got.extend(page.messages.iter().map(|m| m.hash.clone()));
+                    token = page.next_page_token;
+                    if token.is_none() || got.len() > expected.len() {
+                        break;
+                    }
+                }
+                assert_eq!(got, expected, "{:?} reverse={} paged", ctx, reverse);
+            }
+            if ctx.is_hyper() {
+                assert_eq!(CastStore::count_casts_by_parent(&store, &dev).unwrap(), 3);
+            }
+        }
     }
 
     #[tokio::test]

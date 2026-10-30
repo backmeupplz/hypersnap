@@ -240,10 +240,11 @@ pub fn initialize(
 
     let daily_stats_indexer = if config.daily_stats.enabled {
         tracing::info!("Daily stats indexer enabled");
-        Some(Arc::new(DailyStatsIndexer::new(
-            config.daily_stats.clone(),
-            db.clone(),
-        )))
+        Some(Arc::new(
+            DailyStatsIndexer::new(config.daily_stats.clone(), db.clone()).with_signer_lookup(
+                Arc::new(daily_stats::StoreSignerRequesterLookup::new(&shard_stores)),
+            ),
+        ))
     } else {
         None
     };
@@ -1225,7 +1226,8 @@ async fn run_block_backfill(
 
         while height <= max_height {
             let end = (height + BLOCK_BACKFILL_BATCH).min(max_height);
-            let chunks = match stores.shard_store.get_shard_chunks(height, Some(end)) {
+            // The stop block is exclusive; `end` itself belongs to this batch.
+            let chunks = match stores.shard_store.get_shard_chunks(height, Some(end + 1)) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(shard_id, height, error = %e, "Failed to get shard chunks");

@@ -236,7 +236,7 @@ impl LinkStore {
             ..Default::default()
         };
 
-        store.get_remove(&partial_message)
+        store.get_remove(&partial_message, None)
     }
 
     // Generates a unique key used to store a LinkCompactState message key in the store
@@ -338,7 +338,7 @@ impl LinkStore {
             && (link_body.r#type.is_empty() || link_body.r#type.len() == 0)
         {
             return Err(HubError::validation_failure(
-                "targetID provided without type",
+                "targetId provided without type",
             ));
         }
 
