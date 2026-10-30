@@ -57,7 +57,7 @@ use crate::storage::store::account::{
 use crate::storage::store::account::{
     get_channel_keys_by_owner_address, get_channel_keys_for_owner_addresses,
 };
-use crate::storage::store::account::{message_bytes_decode, IntoI32};
+use crate::storage::store::account::{make_ts_hash, message_bytes_decode, IntoI32, PAGE_SIZE_MAX};
 use crate::storage::store::account::{EventsPage, HubEventIdGenerator};
 use crate::storage::store::block_engine::{self, BlockStores};
 use crate::storage::store::engine::{self, Senders, ShardEngine};
@@ -2448,35 +2448,103 @@ impl HubService for MyHubService {
                 "Page token does not match number of shards".to_string(),
             ));
         }
-        let pages: Vec<MessagesPage> = self
-            .shard_stores
+        let page_size = req
+            .page_size
+            .map(|s| s as usize)
+            .filter(|&s| s > 0)
+            .unwrap_or(PAGE_SIZE_MAX);
+        let reverse = req.reverse.unwrap_or(false);
+        // A shard whose casts have all been returned has an empty token, so a
+        // later page doesn't read it again from the start.
+        let pages: Vec<Option<MessagesPage>> =
+            self.shard_stores
+                .iter()
+                .zip(per_shard_tokens.iter())
+                .map(|(shard_entry, shard_token)| {
+                    if shard_token.as_ref().is_some_and(|t| t.is_empty()) {
+                        return None;
+                    }
+                    let page_options = PageOptions {
+                        page_size: Some(page_size),
+                        page_token: shard_token.clone(),
+                        reverse,
+                    };
+                    let cast_store = &shard_entry.1.cast_store;
+                    Some(
+                        CastStore::get_casts_by_parent(cast_store, &parent, &page_options)
+                            .unwrap_or(MessagesPage {
+                                messages: vec![],
+                                next_page_token: None,
+                            }),
+                    )
+                })
+                .collect();
+
+        // Each shard's page is in index order (timestamp, then hash), so the
+        // pages merge into one page of `page_size` casts in that order, and each
+        // shard resumes after the last of its casts the page took.
+        let order = |m: &Message| (m.data.as_ref().map_or(0, |d| d.timestamp), m.hash.clone());
+        let mut merged: Vec<(usize, &Message)> = pages
             .iter()
-            .zip(per_shard_tokens.into_iter())
-            .map(|(shard_entry, shard_token)| {
-                let page_options = PageOptions {
-                    page_size: req.page_size.map(|s| s as usize),
-                    page_token: shard_token,
-                    reverse: req.reverse.unwrap_or(false),
-                };
-                let cast_store = &shard_entry.1.cast_store;
-                return CastStore::get_casts_by_parent(cast_store, &parent, &page_options)
-                    .unwrap_or(MessagesPage {
-                        messages: vec![],
-                        next_page_token: None,
-                    });
+            .enumerate()
+            .flat_map(|(shard, page)| {
+                page.iter()
+                    .flat_map(|p| p.messages.iter())
+                    .map(move |m| (shard, m))
             })
             .collect();
-        let combined_messages: Vec<Message> = pages
+        merged.sort_by(|a, b| {
+            let o = order(a.1).cmp(&order(b.1));
+            if reverse {
+                o.reverse()
+            } else {
+                o
+            }
+        });
+        merged.truncate(page_size);
+        let mut taken = vec![0usize; num_shards];
+        let mut last: Vec<Option<&Message>> = vec![None; num_shards];
+        for (shard, m) in &merged {
+            taken[*shard] += 1;
+            last[*shard] = Some(*m);
+        }
+        let mut next_page_tokens: Vec<Option<Vec<u8>>> = Vec::with_capacity(num_shards);
+        for (shard, (page, token)) in pages.iter().zip(per_shard_tokens).enumerate() {
+            next_page_tokens.push(match (page, last[shard]) {
+                (None, _) => token,
+                // all of the shard's page: its own cursor, or empty when it's done
+                (Some(p), _) if taken[shard] == p.messages.len() => {
+                    Some(p.next_page_token.clone().unwrap_or_default())
+                }
+                (Some(_), Some(m)) => {
+                    let data = m.data.as_ref().ok_or_else(|| {
+                        Status::internal("Cast without data in casts by parent".to_string())
+                    })?;
+                    let ts_hash = make_ts_hash(data.timestamp, &m.hash)
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                    Some(CastStoreDef::make_cast_by_parent_key(
+                        &parent,
+                        data.fid,
+                        Some(&ts_hash),
+                    ))
+                }
+                (Some(_), None) => token,
+            });
+        }
+        let combined_messages: Vec<Message> = merged.into_iter().map(|(_, m)| m.clone()).collect();
+        let next_page_token = if next_page_tokens
             .iter()
-            .flat_map(|page| page.messages.clone())
-            .collect();
-        let next_page_tokens: Vec<Option<Vec<u8>>> =
-            pages.into_iter().map(|page| page.next_page_token).collect();
-        let new_page_token = serde_json::to_vec(&next_page_tokens)
-            .map_err(|e| Status::internal(format!("Failed to serialize next_page_token: {}", e)))?;
+            .all(|t| t.as_ref().is_some_and(|t| t.is_empty()))
+        {
+            None
+        } else {
+            Some(serde_json::to_vec(&next_page_tokens).map_err(|e| {
+                Status::internal(format!("Failed to serialize next_page_token: {}", e))
+            })?)
+        };
         let response = MessagesResponse {
             messages: combined_messages,
-            next_page_token: Some(new_page_token),
+            next_page_token,
         };
 
         Ok(Response::new(response))
