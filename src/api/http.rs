@@ -1427,7 +1427,7 @@ impl ApiHttpHandler {
 
             // === Status endpoints ===
             "/v2/farcaster/stats/daily" => {
-                self.handle_daily_stats(params.get("from"), params.get("to"))
+                self.handle_daily_stats(params.get("from"), params.get("to"), params.get("clients"))
                     .await
             }
             "/v2/farcaster/_status/halt" => self.handle_halt_status().await,
@@ -3483,11 +3483,16 @@ impl ApiHttpHandler {
     }
 
     /// Handle GET /v2/farcaster/_status/backfill
-    /// `GET /v2/farcaster/stats/daily?from=YYYY-MM-DD&to=YYYY-MM-DD`
+    /// `GET /v2/farcaster/stats/daily?from=YYYY-MM-DD&to=YYYY-MM-DD[&clients=N]`
     ///
     /// Node-derived replacement for the Dune daily-activity query. Both bounds
     /// are inclusive and optional: `to` defaults to yesterday, `from` to 30 days
     /// before `to`.
+    ///
+    /// `clients=N` (0..=100) adds a per-client breakdown to each day client
+    /// attribution covers, naming the N app fids with the most fid-days in the
+    /// range and folding the rest into `other`. Off by default, so existing
+    /// consumers see the same shape.
     ///
     /// `to` deliberately defaults to **yesterday**, not today. Today is still
     /// accumulating, so including it puts a partial day at the end of every
@@ -3498,8 +3503,11 @@ impl ApiHttpHandler {
         &self,
         from: Option<&String>,
         to: Option<&String>,
+        clients: Option<&String>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-        use crate::api::daily_stats::{date_string_to_day, day_to_date_string, today};
+        use crate::api::daily_stats::{
+            date_string_to_day, day_to_date_string, today, MAX_TOP_CLIENTS,
+        };
 
         let indexer = self.daily_stats.read().unwrap().clone();
         let Some(indexer) = indexer else {
@@ -3534,10 +3542,25 @@ impl ApiHttpHandler {
             },
             None => to_day.saturating_sub(29),
         };
+        let top_clients = match clients {
+            Some(s) => match s.trim().parse::<usize>() {
+                Ok(n) if n <= MAX_TOP_CLIENTS => Some(n),
+                _ => {
+                    return Ok(Self::error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "Invalid `clients`; expected an integer from 0 to {}",
+                            MAX_TOP_CLIENTS
+                        ),
+                    ))
+                }
+            },
+            None => None,
+        };
 
-        match indexer.range(from_day, to_day) {
+        match indexer.range_with_clients(from_day, to_day, top_clients) {
             Ok(days) => {
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "from": day_to_date_string(from_day),
                     "to": day_to_date_string(to_day),
                     "day_count": days.len(),
@@ -3548,6 +3571,17 @@ impl ApiHttpHandler {
                     },
                     "days": days,
                 });
+                if let Some(top) = top_clients {
+                    body["notes"]["clients"] = serde_json::json!({
+                        "tracked_from": indexer.clients_from_day().map(day_to_date_string),
+                        "top": top,
+                        "client": "the fid that requested the signer a message was signed with; \"self\" when that is the author's own fid; app fids outside the top N by fid-days in this range fold into \"other\"; \"unresolved\" when the signer was not found",
+                        "actions": "cast = top-level cast, reply = cast with a parent cast, like, recast, link = any LinkAdd, delete = cast/reaction/link remove, profile = UserDataAdd, verification = verification add or remove",
+                        "active_fids": "fids with at least one of those actions; unlike casts.unique_authors, not limited to casts",
+                        "retention": "per client, against exactly N days earlier: retained = used the client both days; retained_exclusive = used only that client both days; gained_from_other_clients = uses it now but N days earlier was active only elsewhere; lost_to_other_clients = the reverse. Windows reaching before tracked_from are null",
+                        "partial": "true on tracked_from, which is only counted from when the node started attributing",
+                    });
+                }
                 Ok(Self::json_response(StatusCode::OK, &body))
             }
             Err(crate::api::indexer::IndexerError::InvalidData(msg)) => {
@@ -4868,7 +4902,7 @@ mod tests {
     #[tokio::test]
     async fn test_daily_stats_unavailable_when_not_enabled() {
         let handler = ApiHttpHandler::new(None, None, None, None, None, None);
-        let response = handler.handle_daily_stats(None, None).await.unwrap();
+        let response = handler.handle_daily_stats(None, None, None).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -4892,17 +4926,41 @@ mod tests {
         )));
 
         let bad = "2026-13-99".to_string();
-        let response = handler.handle_daily_stats(Some(&bad), None).await.unwrap();
+        let response = handler
+            .handle_daily_stats(Some(&bad), None, None)
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         // Inverted range is a client error, not a 500.
         let from = "2026-08-10".to_string();
         let to = "2026-08-01".to_string();
         let response = handler
-            .handle_daily_stats(Some(&from), Some(&to))
+            .handle_daily_stats(Some(&from), Some(&to), None)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // `clients` must be a small non-negative integer.
+        for bad in ["-1", "101", "all"] {
+            let bad = bad.to_string();
+            let response = handler
+                .handle_daily_stats(None, None, Some(&bad))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "clients={}",
+                bad
+            );
+        }
+        let ok = "5".to_string();
+        let response = handler
+            .handle_daily_stats(None, None, Some(&ok))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

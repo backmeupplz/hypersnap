@@ -8,14 +8,12 @@ services:
     init: true # Auto-reap zombie processes and forward process signals
     environment:
       RUST_BACKTRACE: "full"
-    entrypoint:
-      - "/bin/bash"
-      - "-c"
-      - |
-        #!/bin/bash
-        set -euo pipefail
-        cat > config.toml <<'EOF'
-
+      # The node config. The entrypoint writes it to config.toml. It lives here
+      # rather than in the entrypoint because docker-init, the container's first
+      # process, keeps the entrypoint in its arguments while the container runs,
+      # and `ps` shows process arguments to every user on the host.
+      # Compose substitutes ${VAR} in this text: write a literal $ as $$.
+      HYPERSNAP_CONFIG: |
         rpc_address="0.0.0.0:3383"
         http_address="0.0.0.0:3381"
         rocksdb_dir=".rocks"
@@ -66,11 +64,15 @@ services:
         [snapshot]
         endpoint_url = "https://e1f9f185c6e63471dd39f96abd3413c4.r2.cloudflarestorage.com"
         load_db_from_snapshot=true
-        EOF
-        # Append validator sets from the dedicated validators.toml file.
-        # See validators.toml for the full history of validator changes and operator details.
-        cat /app/validators.toml >> config.toml
-        exec $0 $@ # Now run the original command
+    # Writes HYPERSNAP_CONFIG to config.toml, appends the validator sets from the
+    # dedicated validators.toml file, then runs the command. See validators.toml
+    # for the full history of validator changes and operator details. It unsets
+    # HYPERSNAP_CONFIG first, so the node's environment holds no copy. Keep this
+    # line short, for the reason given above HYPERSNAP_CONFIG.
+    entrypoint:
+      - "/bin/bash"
+      - "-c"
+      - 'set -euo pipefail; printf "%s\n" "$$HYPERSNAP_CONFIG" > config.toml; unset HYPERSNAP_CONFIG; cat /app/validators.toml >> config.toml; exec "$$0" "$$@"'
     command: [ "./hypersnap", "--config-path", "config.toml" ]
     depends_on:
       # Ensures statsd is registered with the DNS resolver before the node

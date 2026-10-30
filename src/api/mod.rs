@@ -240,10 +240,11 @@ pub fn initialize(
 
     let daily_stats_indexer = if config.daily_stats.enabled {
         tracing::info!("Daily stats indexer enabled");
-        Some(Arc::new(DailyStatsIndexer::new(
-            config.daily_stats.clone(),
-            db.clone(),
-        )))
+        Some(Arc::new(
+            DailyStatsIndexer::new(config.daily_stats.clone(), db.clone()).with_signer_lookup(
+                Arc::new(daily_stats::StoreSignerRequesterLookup::new(&shard_stores)),
+            ),
+        ))
     } else {
         None
     };
