@@ -19,6 +19,9 @@ env:
   ETH_SIGNATURE_VERIFIER_GIT_REF: "8deb4a091982c345949dc66bf8684489d9f11889"
   RUSTFLAGS: "-Dwarnings -A mismatched_lifetime_syntaxes"
   CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  CARGO_INCREMENTAL: "0"
   # CI never reads debug info, and it's much of what compiling and linking
   # (and the cache) cost. Line tables keep panics' backtraces readable.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -81,10 +84,9 @@ jobs:
 
       # Dependencies (and malachite) come from the cache, so a PR only
       # recompiles snapchain itself. Only main saves, so PRs can't evict it.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: snapchain
-          save-if: true
+      # sccache keeps each compiled crate in the Actions cache, so a lockfile
+      # or toolchain change only rebuilds the crates that changed.
+      - uses: mozilla-actions/sccache-action@v0.0.9
 
       - working-directory: ./snapchain
         run: cargo test
@@ -99,3 +101,6 @@ jobs:
 
       - working-directory: ./snapchain/tests/client_parity_tests
         run: yarn test
+
+      - if: always()
+        run: sccache --show-stats
