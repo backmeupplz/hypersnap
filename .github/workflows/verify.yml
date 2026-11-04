@@ -67,7 +67,7 @@ jobs:
         suite: [unit, integration-1, integration-2]
     env:
       # main's integration job builds every target and saves the caches
-      SAVE_CACHE: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'integration-1' }}
+      SAVE_CACHE: ${{ matrix.suite == 'integration-1' }}
     steps:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
