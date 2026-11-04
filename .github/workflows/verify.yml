@@ -77,7 +77,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: snapchain
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
 
       - working-directory: ./snapchain
         run: cargo test
