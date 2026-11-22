@@ -9,7 +9,7 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    - cron: "17 4 * * 1" # a fresh seed from mainnet every week
+    - cron: "17 4 * * *" # a fresh seed, and a chain on the newest release, daily
   workflow_dispatch:
 
 permissions:
@@ -33,6 +33,9 @@ env:
 jobs:
   rollout:
     timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: write # main deletes the Ogre caches it supersedes
     runs-on: ${{ vars.RUNS_ON == 'true' && fromJSON(format('["runs-on={0}","runner=64cpu-linux-arm64"]', github.run_id)) || 'ubuntu-24.04-arm' }}
     steps:
       - name: Install Protoc
@@ -139,3 +142,13 @@ jobs:
           name: ogre-logs
           path: ogre/run/logs
           retention-days: 7
+
+      - name: Delete superseded Ogre caches
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEED: ${{ steps.seed.outputs.cache-matched-key || format('ogre-seed-v1-{0}', github.run_id) }}
+          CHAIN: ${{ steps.chain.outputs.cache-primary-key }}
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key ogre- --ref refs/heads/main --limit 100 --json key --jq '.[].key' |
+            grep -vx -e "$SEED" -e "$CHAIN" | xargs -r -n1 gh cache delete --repo "$GITHUB_REPOSITORY"

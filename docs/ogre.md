@@ -17,11 +17,12 @@ original hash, so the devnet stores them with their original signatures. A
 devnet accepts messages signed for mainnet. Messages signed by gasless keys are
 left out, since the API doesn't return KEY_ADD messages; ENS names, contract
 verifications and anything else that needs an L1 or L2 client is refused by the
-devnet and reported.
+devnet and reported. Each run starts from the same chain; nothing is uploaded
+as a snapshot.
 
 `ogre chain` builds that chain on the release mainnet runs
 (`farcasterorg/hypersnap:latest`) and stops it. CI caches the seed (refreshed
-weekly) and the chain (per base release and seed), so a run starts from a
+daily) and the chain (per base release and seed), so a run starts from a
 stopped network, the way an operator's node is upgraded.
 
 `ogre run` then:
@@ -31,16 +32,19 @@ stopped network, the way an operator's node is upgraded.
    again.
 2. Calls every read endpoint on the read node under test and on the base read
    node, and fails when the build returns an error, an empty result or fewer
-   fields than the base release does.
+   fields than the base release does. Endpoints where the base release has no
+   data are listed as not compared, and different values are warnings.
 3. Signs up a native account with a gasless signer, as new users do, and sends
    casts, a reply, a mention, a like, a recast and follows from it and from a
    real seeded account, through the read node's HTTP API. It checks every node
-   stores them and the API shows them: following feed, notifications,
+   at the tip stores them and the API shows them: following feed, notifications,
    conversation, author feed, profile counts, like count and search.
 4. Restarts validators 1-4 on the build one at a time (a rolling upgrade),
    then sends the writes again through the base read node.
-5. Kills a validator and restarts it, and checks a read node that started with
-   an empty database has synced.
+5. Kills a validator and restarts it. A read node that started with an empty
+   database replays the chain from block 1 on the build the whole time; it has
+   to keep making progress (a debug build replays too slowly to reach the tip
+   in a run).
 
 It fails on any of those, on a shard going longer than `--max-stall` without a
 block, on a node exiting, and on a panic while nodes run (panics during a

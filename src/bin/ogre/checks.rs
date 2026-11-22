@@ -245,8 +245,8 @@ fn missing(base: &Value, under: &Value, path: &str, out: &mut Vec<String>) {
 
 /// Every endpoint on the API node under test against the base reference node,
 /// on the same chain at (nearly) the same height.
-pub async fn endpoints(net: &Net, s: &Subjects, f: &mut Findings) {
-    let mut checked = 0;
+pub async fn endpoints(net: &Net, s: &Subjects, f: &mut Findings) -> String {
+    let (mut compared, mut skipped) = (0, Vec::new());
     for path in s.endpoints() {
         let (under, base) = tokio::join!(net.get(net::API, &path), net.get(net::REFERENCE, &path));
         let (u_status, u_body) = match under {
@@ -256,13 +256,16 @@ pub async fn endpoints(net: &Net, s: &Subjects, f: &mut Findings) {
                 continue;
             }
         };
-        checked += 1;
         if u_status >= 500 {
             f.fail(format!("{path}: HTTP {u_status} {}", short(&u_body)));
             continue;
         }
-        let Ok((b_status, b_body)) = base else {
-            continue;
+        let (b_status, b_body) = match base {
+            Ok(r) => r,
+            Err(e) => {
+                skipped.push(format!("{path} (base release: {e})"));
+                continue;
+            }
         };
         if (200..300).contains(&b_status) && !(200..300).contains(&u_status) {
             f.fail(format!(
@@ -271,10 +274,16 @@ pub async fn endpoints(net: &Net, s: &Subjects, f: &mut Findings) {
             ));
             continue;
         }
-        if !(200..300).contains(&b_status) {
+        // Nothing to compare against: the base release errs or has no data here.
+        if !(200..300).contains(&b_status) || is_empty(&b_body) {
+            skipped.push(format!(
+                "{path} (base release: HTTP {b_status}, {})",
+                short(&b_body)
+            ));
             continue;
         }
-        if !is_empty(&b_body) && is_empty(&u_body) {
+        compared += 1;
+        if is_empty(&u_body) {
             f.fail(format!("{path}: empty, the base release returns data"));
             continue;
         }
@@ -285,13 +294,39 @@ pub async fn endpoints(net: &Net, s: &Subjects, f: &mut Findings) {
                 "{path}: fields the base release returns are missing: {}",
                 gone.join(", ")
             ));
-        } else if strip_volatile(&b_body) != strip_volatile(&u_body) {
+        } else if let Some(d) =
+            first_difference(&strip_volatile(&b_body), &strip_volatile(&u_body), "")
+        {
             f.warn(format!(
-                "{path}: same shape, different values than the base release"
+                "{path}: same shape, different values than the base release: {d}"
             ));
         }
     }
-    eprintln!("  {checked} endpoints answered");
+    let summary = format!(
+        "{compared} endpoints compared with the base release; {} skipped because the base release has no data there",
+        skipped.len()
+    );
+    eprintln!("  {summary}");
+    for s in &skipped {
+        f.warn(format!("not compared: {s}"));
+    }
+    summary
+}
+
+/// The first value that differs, as `path: base -> under`.
+fn first_difference(base: &Value, under: &Value, path: &str) -> Option<String> {
+    match (base, under) {
+        (Value::Object(b), Value::Object(u)) => b.iter().find_map(|(k, bv)| {
+            first_difference(bv, u.get(k).unwrap_or(&Value::Null), &format!("{path}.{k}"))
+        }),
+        (Value::Array(b), Value::Array(u)) if b.len() == u.len() => b
+            .iter()
+            .zip(u)
+            .enumerate()
+            .find_map(|(i, (bv, uv))| first_difference(bv, uv, &format!("{path}[{i}]"))),
+        _ if base == under => None,
+        _ => Some(format!("{path}: {} -> {}", short(base), short(under))),
+    }
 }
 
 fn strip_volatile(v: &Value) -> Value {
@@ -322,7 +357,7 @@ fn strip_volatile(v: &Value) -> Value {
 
 fn short(v: &Value) -> String {
     let s = v.to_string();
-    s.chars().take(200).collect()
+    s.chars().take(120).collect()
 }
 
 /// Accounts that sign the messages the write checks send.

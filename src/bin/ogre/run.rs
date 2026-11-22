@@ -434,7 +434,8 @@ async fn scenario(
     let signup_started = Instant::now();
 
     r.phase("Read API: every endpoint against the base reference node");
-    checks::endpoints(net, s, &mut r.findings).await;
+    let summary = checks::endpoints(net, s, &mut r.findings).await;
+    r.note(summary);
 
     r.phase("Writes through the API node under test (mixed network)");
     let native = signup.await??;
