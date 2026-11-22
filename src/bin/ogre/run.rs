@@ -477,19 +477,34 @@ async fn scenario(
         t.elapsed()
     ));
 
-    r.phase("Fresh read node: synced from an empty database");
-    let t = Instant::now();
-    match net
-        .wait_caught_up(net::FRESH, 2, Duration::from_secs(60))
+    // A read node replaying the whole chain from block 1 on the build under
+    // test: a change to how blocks apply shows up as it stopping. A debug build
+    // replays slowly, so it only has to keep going, not reach the tip.
+    r.phase("Fresh read node: replaying the chain from an empty database");
+    let fresh = net::FRESH;
+    let before = net
+        .heights(fresh)
         .await
-    {
-        Ok(_) => r.note(format!(
-            "node {} at the tip ({:.1?} more)",
-            net::FRESH,
-            t.elapsed()
-        )),
-        Err(e) => r.findings.fail(format!("fresh read node: {e}")),
+        .ok_or("fresh read node stopped answering")?;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let after = net
+        .heights(fresh)
+        .await
+        .ok_or("fresh read node stopped answering")?;
+    let tip = net
+        .heights(net::API)
+        .await
+        .ok_or("API node stopped answering")?;
+    for sh in 0..3 {
+        let synced = after[sh] + 2 >= tip[sh];
+        if !synced && after[sh] <= before[sh] {
+            r.findings.fail(format!(
+                "fresh read node stopped replaying shard {sh} at height {} (tip {})",
+                after[sh], tip[sh]
+            ));
+        }
     }
+    r.note(format!("fresh read node at heights {after:?}, tip {tip:?}"));
 
     let worst = watch.finish().await;
     r.note(format!(

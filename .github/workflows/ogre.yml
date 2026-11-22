@@ -110,7 +110,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ogre/chain
-          key: ogre-chain-v1-${{ steps.digest.outputs.sha }}-${{ hashFiles('ogre/seed.bin', 'snapchain/src/bin/ogre/net.rs', 'snapchain/src/bin/ogre/run.rs', 'snapchain/src/bin/ogre/seed.rs') }}
+          # Bump v1 when `ogre chain` builds a different chain.
+          key: ogre-chain-v1-${{ steps.digest.outputs.sha }}-${{ hashFiles('ogre/seed.bin', 'snapchain/src/bin/ogre/net.rs') }}
 
       - name: Build the seeded chain on the base release
         if: steps.chain.outputs.cache-hit != 'true'

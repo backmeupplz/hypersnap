@@ -687,7 +687,12 @@ pub async fn writes(
     let t = Instant::now();
     let deadline = Duration::from_secs(30);
     // Every node stores the casts.
-    for node in net.nodes.iter().filter(|n| n.running()) {
+    // Every node at the tip stores them; the fresh node is still replaying.
+    for node in net
+        .nodes
+        .iter()
+        .filter(|n| n.running() && n.i != net::FRESH)
+    {
         for (what, fid, m) in [
             ("cast", w.legacy_fid, &mention),
             ("native cast", *nfid, &native_cast),
