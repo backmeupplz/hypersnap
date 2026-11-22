@@ -590,8 +590,11 @@ pub fn initialize(
         .collect();
     // Events still queued when the node last stopped never reached the
     // notifications index; replay from the last block it indexed to the tip.
+    // And one block past it: the engine sends a block's events before it
+    // stores the block, so the next block's events may have gone out before
+    // the bridges subscribed. The repair waits until that block is stored.
     for (shard_id, from, to) in notifications_indexer.replay_ranges(&tips) {
-        index_gaps.lost(shard_id, from, to);
+        index_gaps.lost(shard_id, from, to + 1);
     }
     index_gaps::spawn_repair(
         index_gaps.clone(),
