@@ -5,9 +5,9 @@ name: Ogre
 # every read endpoint, and new messages landing everywhere. See docs/ogre.md.
 on:
   push:
-    branches: [main]
+    branches: [ogre-bench]
   pull_request:
-    branches: [main]
+    branches: [ogre-bench]
   schedule:
     - cron: "17 4 * * *" # a fresh seed, and a chain on the newest release, daily
   workflow_dispatch:
@@ -140,14 +140,14 @@ jobs:
       # over quota, evicting Verify's. A pull request that changes Ogre's code
       # rebuilds the chain on each run (about 4.5 minutes).
       - name: Save the seeded chain
-        if: steps.chain.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        if: steps.chain.outputs.cache-hit != 'true' && github.ref == 'refs/heads/ogre-bench'
         uses: actions/cache/save@v4
         with:
           path: ogre/chain
           key: ${{ steps.chain.outputs.cache-primary-key }}
 
       - name: Save the seed
-        if: steps.seed.outputs.cache-matched-key == '' && github.ref == 'refs/heads/main'
+        if: steps.seed.outputs.cache-matched-key == '' && github.ref == 'refs/heads/ogre-bench'
         uses: actions/cache/save@v4
         with:
           path: ogre/seed.bin
@@ -165,13 +165,13 @@ jobs:
 
       # Only caches older than this run: a nightly running alongside keeps its own.
       - name: Delete superseded Ogre caches
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/ogre-bench'
         env:
           GH_TOKEN: ${{ github.token }}
           SEED: ${{ steps.seed.outputs.cache-matched-key || steps.seed.outputs.cache-primary-key }}
           CHAIN: ${{ steps.chain.outputs.cache-primary-key }}
           START: ${{ steps.start.outputs.at }}
         run: |
-          gh cache list --repo "$GITHUB_REPOSITORY" --key ogre- --ref refs/heads/main --limit 100 --json key,createdAt \
+          gh cache list --repo "$GITHUB_REPOSITORY" --key ogre- --ref refs/heads/ogre-bench --limit 100 --json key,createdAt \
             --jq '.[] | select(.createdAt < env.START) | .key' |
             grep -vx -e "$SEED" -e "$CHAIN" | xargs -r -n1 gh cache delete --repo "$GITHUB_REPOSITORY"
