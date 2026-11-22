@@ -129,7 +129,7 @@ jobs:
 
       - name: Roll out
         run: |
-          for i in 1 2 3; do rm -rf ogre/run; cp -a ogre/chain ogre/run; start=$(date +%s); snapchain/target/debug/ogre run --seed ogre/seed.bin --base "docker:${{ steps.digest.outputs.image }}" --under-test snapchain/target/debug/hypersnap --work ogre/run --report "$GITHUB_STEP_SUMMARY" > "trial-$i.log" 2>&1; echo "TRIAL $i exit=$? secs=$(( $(date +%s)-start ))"; grep -E "FAIL|warn the API|same shape|^## Ogre" "trial-$i.log" | head -20; done
+          set +e; for i in 1 2 3 4; do rm -rf ogre/run; cp -a ogre/chain ogre/run; start=$(date +%s); snapchain/target/debug/ogre run --seed ogre/seed.bin --base "docker:${{ steps.digest.outputs.image }}" --under-test snapchain/target/debug/hypersnap --work ogre/run --report "$GITHUB_STEP_SUMMARY" > "trial-$i.log" 2>&1; echo "TRIAL $i exit=$? secs=$(( $(date +%s)-start ))"; grep -E "FAIL|warn the API|same shape|^## Ogre|^  [a-z].* in [0-9]" "trial-$i.log" | cut -c1-250 | head -30; done; set -e
           rm -rf ogre/run
           cp -a ogre/chain ogre/run
           snapchain/target/debug/ogre run --seed ogre/seed.bin \
