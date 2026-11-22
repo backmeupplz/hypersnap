@@ -406,10 +406,15 @@ pub async fn wait_legacy_signer(net: &Net, fid: u64) -> Result<(), Error> {
 
 /// Mines and submits a native registration for `custody`, then a KEY_ADD for a
 /// fresh signer, through the API node. Returns the fid and signer.
-pub async fn register_native(
-    api: Api,
-    custody: PrivateKeySigner,
-) -> Result<(u64, SigningKey), Error> {
+/// The new account, and whether the node dropped the first registration it
+/// accepted.
+pub struct Signup {
+    pub fid: u64,
+    pub signer: SigningKey,
+    pub dropped: bool,
+}
+
+pub async fn register_native(api: Api, custody: PrivateKeySigner) -> Result<Signup, Error> {
     use alloy_dyn_abi::TypedData;
     use alloy_signer::SignerSync;
     use prost::Message as _;
@@ -463,28 +468,43 @@ pub async fn register_native(
         ),
     };
     let bytes = data.encode_to_vec();
-    rpc.submit_message(proto::Message {
+    let registration = proto::Message {
         data: Some(data),
         data_bytes: Some(bytes.clone()),
         hash: snapchain::storage::util::blake3_20(&bytes).to_vec(),
         hash_scheme: proto::HashScheme::Blake3 as i32,
         ..Default::default()
-    })
-    .await?;
-    let fid = poll(Duration::from_secs(30), || {
-        let mut rpc = rpc.clone();
-        async move {
-            rpc.get_native_account(proto::NativeAccountRequest {
-                fid: 0,
-                custody_address: address.to_vec(),
-            })
-            .await
-            .ok()
-            .map(|r| r.into_inner().fid)
+    };
+    let lookup = rpc.clone();
+    let registered = || {
+        let rpc = lookup.clone();
+        poll(Duration::from_secs(15), move || {
+            let mut rpc = rpc.clone();
+            async move {
+                rpc.get_native_account(proto::NativeAccountRequest {
+                    fid: 0,
+                    custody_address: address.to_vec(),
+                })
+                .await
+                .ok()
+                .map(|r| r.into_inner().fid)
+            }
+        })
+    };
+    // A client that sees no account resubmits once; a node that accepted the
+    // registration and dropped it is reported either way.
+    let mut dropped = false;
+    rpc.submit_message(registration.clone()).await?;
+    let fid = match registered().await {
+        Some(fid) => fid,
+        None => {
+            dropped = true;
+            rpc.submit_message(registration).await?;
+            registered()
+                .await
+                .ok_or("native registration wasn't included, resubmitted once, after 30s")?
         }
-    })
-    .await
-    .ok_or("native registration wasn't included within 30s")?;
+    };
 
     let signer = SigningKey::generate(&mut rand::rngs::OsRng);
     let now = messages_factory::farcaster_time();
@@ -537,7 +557,11 @@ pub async fn register_native(
     })
     .await
     .ok_or("the gasless signer wasn't usable within 30s")?;
-    Ok((fid, signer))
+    Ok(Signup {
+        fid,
+        signer,
+        dropped,
+    })
 }
 
 /// Finds a registration proof-of-work nonce on every core.

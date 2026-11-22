@@ -438,12 +438,18 @@ async fn scenario(
     r.note(summary);
 
     r.phase("Writes through the API node under test (mixed network)");
-    let native = signup.await??;
+    let signup = signup.await??;
+    if signup.dropped {
+        r.findings.warn(
+            "the API node accepted the native registration and dropped it; it landed when resubmitted",
+        );
+    }
     r.note(format!(
         "native account {} signed up with a gasless signer {:.1?} after starting",
-        native.0,
+        signup.fid,
         signup_started.elapsed()
     ));
+    let native = (signup.fid, signup.signer);
     let w = Writers {
         legacy_fid: s.fid2,
         legacy_key: checks::legacy_key(),
