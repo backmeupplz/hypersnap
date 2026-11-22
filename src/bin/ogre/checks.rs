@@ -712,7 +712,7 @@ pub async fn writes(
     }
     let landed = t.elapsed();
 
-    let views: Vec<(&str, String, Box<dyn Fn(&Value) -> bool + Send + Sync>)> = vec![
+    let views: Vec<(&str, String, Check)> = vec![
         (
             "following feed shows a followed account's new cast",
             format!("/v2/farcaster/feed/following?fid={nfid}&limit=25"),
@@ -786,7 +786,10 @@ pub async fn writes(
     eprintln!("  {round}: 7 messages on every node in {landed:.1?}");
 }
 
-fn contains(hash: String) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+/// A test of an API response.
+type Check = Box<dyn Fn(&Value) -> bool + Send + Sync>;
+
+fn contains(hash: String) -> Check {
     let bare = hash.trim_start_matches("0x").to_string();
     Box::new(move |v: &Value| {
         let s = v.to_string();

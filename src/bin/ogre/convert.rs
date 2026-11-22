@@ -378,3 +378,23 @@ pub fn username_proof(p: &json::UserNameProof) -> Result<proto::UserNameProof, E
         )? as i32,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real mainnet cast whose client wrote empty `mentions` and
+    /// `mentions_positions` out (`12 00`, `2a 00`); the JSON can't show that.
+    #[test]
+    fn rebuilds_a_cast_from_its_json_with_its_original_bytes() {
+        let m: json::Message = serde_json::from_str(r#"{"data":{"type":"MESSAGE_TYPE_CAST_ADD","fid":3,"timestamp":185074080,"network":"FARCASTER_NETWORK_MAINNET","castAddBody":{"embedsDeprecated":[],"mentions":[],"parentCastId":null,"parentUrl":null,"text":"Good book","embeds":[{"castId":{"fid":1,"hash":"0x39c77976ededc0946c4ee7e9e6bd25b4160265c3"}}],"mentionsPositions":[],"type":"CAST"}},"hash":"0x868360949ea7ac68b242e088fb58b829fcb9d188","hashScheme":"HASH_SCHEME_BLAKE3","signature":"napwMStaCJwBIbEVrMb3FJvWKpQYt3MmIvISnBdxzzRG/mJXmkL/J7G/YFYHEk1Hrc9r0sRJnPf55+8ZNFwICQ==","signatureScheme":"SIGNATURE_SCHEME_ED25519","signer":"0xc887f5bf385a4718eaee166481f1832198938cf33e98a82dc81a0b4b81ffe33d"}"#).unwrap();
+        let rebuilt = message(&m).unwrap();
+        assert_eq!(
+            hex::encode(rebuilt.data_bytes.unwrap()),
+            "0801100318a083a05820012a2b12002209476f6f6420626f6f6b2a00321a12180801121439c77976ededc0946c4ee7e9e6bd25b4160265c3"
+        );
+        let mut tampered = m.clone();
+        tampered.data.cast_add_body.as_mut().unwrap().text = "Bad book".into();
+        assert!(message(&tampered).is_err());
+    }
+}
