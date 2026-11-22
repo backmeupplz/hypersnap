@@ -576,6 +576,12 @@ pub fn initialize(
     } else {
         None
     };
+    // The bridges subscribe before the tips are read, so a block committed
+    // in between reaches them instead of falling between the replay and live.
+    let event_rxs: Vec<_> = hub_event_senders
+        .iter()
+        .map(|(shard_id, tx)| (*shard_id, tx.subscribe()))
+        .collect();
     // A shard whose tip can't be read is left out, rather than taken as 0
     // (which would store 0 as the notifications index's mark for it).
     let tips: HashMap<u32, u64> = shard_stores
@@ -699,12 +705,11 @@ pub fn initialize(
     }
 
     // Create bridges for each shard, gated on backfill completion
-    for (shard_id, hub_event_tx) in hub_event_senders {
-        let bridge = HubEventBridge::from_sender(&hub_event_tx, index_tx.clone(), shard_id)
-            .with_gaps(
-                index_gaps.clone(),
-                tips.get(&shard_id).copied().unwrap_or(0),
-            );
+    for (shard_id, event_rx) in event_rxs {
+        let bridge = HubEventBridge::new(event_rx, index_tx.clone(), shard_id).with_gaps(
+            index_gaps.clone(),
+            tips.get(&shard_id).copied().unwrap_or(0),
+        );
         let mut rx = backfill_done_tx.subscribe();
         let handle = tokio::spawn(async move {
             // Wait until backfill is done (checks current value first, no race)
